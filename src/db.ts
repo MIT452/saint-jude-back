@@ -9,4 +9,6 @@ export const pool = mysql.createPool({
   database: process.env.DB_NAME ?? 'saint_jude',
   waitForConnections: true,
   connectionLimit: 10,
+  // Requis par la plupart des hébergeurs MySQL gratuits (ex: TiDB Cloud) — inutile en local
+  ssl: process.env.DB_SSL === 'true' ? { minVersion: 'TLSv1.2', rejectUnauthorized: true } : undefined,
 });

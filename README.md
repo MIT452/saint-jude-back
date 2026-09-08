@@ -3,13 +3,28 @@
 Ce dossier contient l'API qui permet à votre application frontend de fonctionner avec une vraie
 base de données MySQL en local, au lieu des données simulées actuelles.
 
+## Ce qu'il vous faut avant de commencer
 
+- Node.js installé (version 18 ou plus) — vous l'avez sûrement déjà si le frontend tourne.
+- MySQL installé et lancé sur votre machine (vous avez confirmé que c'est le cas).
+- Un terminal.
 
 ## Étape 1 — Créer la base de données
 
+Ouvrez un terminal **dans ce dossier** (`stjude-backend`) et lancez :
 
+```bash
+mysql -u root -p < schema.sql
+```
 
-ouvrez votre client MySQL et exécutez le contenu du fichier `schema.sql` manuellement.
+- Il vous demandera le mot de passe MySQL de l'utilisateur `root` (laissez vide et appuyez sur
+  Entrée si vous n'en avez pas défini).
+- Cette commande crée la base `saint_jude` et toutes les tables nécessaires (`user`, `boats`,
+  `trips`, `reservations`, `goods`, `cashmovements`, `fuelconsumptions`), ainsi qu'un premier
+  utilisateur de connexion.
+
+Si la commande `mysql` n'est pas reconnue, ouvrez votre client MySQL habituel (MySQL Workbench,
+phpMyAdmin, TablePlus...) et exécutez le contenu du fichier `schema.sql` manuellement.
 
 ## Étape 2 — Configurer la connexion
 
@@ -76,4 +91,12 @@ SQL (Jean Paul).
 - **`Unknown database 'saint_jude'`** : l'étape 1 n'a pas été exécutée correctement — relancez la
   commande `mysql -u root -p < schema.sql`.
 
+## Comment ça correspond à votre code frontend
 
+- Le frontend appelle son API via `src/data/service.ts`, qui pointe vers
+  `http://localhost:3000/api/<nom_entité>` (ex : `/api/goods`, `/api/trips`...).
+- Ces noms viennent de `TABLE_DATA_BASE` dans `src/data/type.ts`.
+- Ce backend expose exactement ces mêmes routes (`GET`, `GET/:id`, `POST`, `PUT/:id`,
+  `DELETE/:id`), avec des colonnes MySQL qui reprennent les mêmes noms de champs que vos
+  interfaces TypeScript (`Goods`, `Reservation`, `Trip`, `Boat`, `CashMovement`,
+  `FuelConsumption`, `User`) — aucune adaptation du code frontend n'est donc nécessaire.
