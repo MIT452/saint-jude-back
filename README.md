@@ -1,3 +1,5 @@
+Géré par: RABETOKOTANY Ny Tsanta FIderana
+
 # Backend Saint-Jude (MySQL)
 
 Ce dossier contient l'API qui permet à votre application frontend de fonctionner avec une vraie
