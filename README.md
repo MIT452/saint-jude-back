@@ -1,4 +1,4 @@
-Créé etgéré par: RABETOKOTANY Ny Tsanta FIderana
+Créé et géré par: RABETOKOTANY Ny Tsanta FIderana
 
 # Backend Saint-Jude (MySQL)
 
