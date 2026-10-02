@@ -7,7 +7,7 @@ export interface CrudOptions {
   table: string;
   // Colonnes booléennes à exposer/recevoir comme booléens JS
   booleanFields?: string[];
-  // colonnes JSON à parser/sérialiser automatiquement
+  // Colonnes JSON à sérialiser automatiquement avant l'écriture
   jsonFields?: string[];
 }
 
@@ -23,6 +23,12 @@ function rowIn(body: Record<string, unknown>, opts: CrudOptions) {
   const out: Record<string, unknown> = { ...body };
   for (const f of opts.booleanFields ?? []) {
     if (f in out) out[f] = Boolean(out[f]);
+  }
+  for (const f of opts.jsonFields ?? []) {
+    const v = out[f];
+    if (v !== undefined && v !== null && typeof v !== 'string') {
+      out[f] = JSON.stringify(v);
+    }
   }
   return out;
 }
