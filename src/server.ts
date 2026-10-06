@@ -6,6 +6,7 @@ import { createServer } from 'http';
 
 import { createCrudRouter } from './utils/crudRouter.js';
 import { aiRouter } from './routes/ai.js';
+import reservationAiRouter from './routes/reservations-ai.js';
 import { positionsRouter } from './routes/positions.js';
 import { optimizationRouter } from './routes/optimization.js';
 import routesRouter from './routes/routes.js';
@@ -65,6 +66,11 @@ app.use(
     table: 'goods',
     booleanFields: ['status'],
   })
+);
+
+app.use(
+  '/api/reservations/ai',
+  reservationAiRouter
 );
 
 app.use(

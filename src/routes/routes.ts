@@ -64,7 +64,10 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const data = await response.json();
+    const data = (await response.json()) as {
+      code?: string;
+      routes?: Array<{ distance: number; duration: number; geometry: unknown }>;
+    };
 
     if (data.code !== 'Ok' || !data.routes?.length) {
       return res.status(400).json({
