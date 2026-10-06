@@ -108,16 +108,16 @@ app.use(
 app.use(
   '/api/reservations',
   requireAuth,
-  createCrudRouter({
-    table: 'reservations',
-    booleanFields: ['paymentStatus'],
-  })
+  reservationStatusRouter
 );
 
 app.use(
   '/api/reservations',
   requireAuth,
-  reservationStatusRouter
+  createCrudRouter({
+    table: 'reservations',
+    booleanFields: ['paymentStatus'],
+  })
 );
 
 app.use(
