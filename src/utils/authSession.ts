@@ -10,7 +10,7 @@ interface SessionClaims {
   expiresAt: number;
 }
 
-interface SessionUser {
+export interface SessionUser {
   id: string;
   name: string;
   lastName: string;
@@ -19,6 +19,58 @@ interface SessionUser {
   role: string;
   permissions: unknown;
 }
+
+export const normalizePermissions = (permissions: unknown): string[] => {
+  if (Array.isArray(permissions)) {
+    return permissions.flatMap((permission) => {
+      if (typeof permission === "string") {
+        return [permission];
+      }
+      return [];
+    });
+  }
+
+  if (typeof permissions === "string") {
+    try {
+      return normalizePermissions(JSON.parse(permissions));
+    } catch {
+      return [];
+    }
+  }
+
+  if (permissions && typeof permissions === "object") {
+    return Object.values(permissions as Record<string, unknown>).flatMap((value) => normalizePermissions(value));
+  }
+
+  return [];
+};
+
+export const hasRole = (user: Pick<SessionUser, "role"> | null | undefined, ...roles: string[]) => {
+  if (!user?.role) {
+    return false;
+  }
+
+  if (roles.length === 0) {
+    return true;
+  }
+
+  return roles.some((role) => role.toLowerCase() === user.role.toLowerCase());
+};
+
+export const hasPermission = (
+  user: Pick<SessionUser, "permissions"> | null | undefined,
+  ...permissions: string[]
+) => {
+  const userPermissions = normalizePermissions(user?.permissions);
+
+  if (permissions.length === 0) {
+    return userPermissions.length > 0;
+  }
+
+  return permissions.some((permission) =>
+    userPermissions.some((userPermission) => userPermission.toLowerCase() === permission.toLowerCase())
+  );
+};
 
 const getAuthSecret = () => {
   const secret = process.env.AUTH_SECRET;
@@ -116,14 +168,37 @@ export const requireAuth: RequestHandler = async (request, response, next) => {
   }
 };
 
-export const requireOwner: RequestHandler = (_request, response, next) => {
-  const user = response.locals.sessionUser as SessionUser | undefined;
-  if (user?.role !== "Propriétaire") {
-    response.status(403).json({ error: "Accès réservé au propriétaire." });
-    return;
-  }
-  next();
+export const requireRole = (...roles: string[]): RequestHandler => {
+  return (_request, response, next) => {
+    const user = response.locals.sessionUser as SessionUser | undefined;
+    if (!user || !hasRole(user, ...roles)) {
+      response.status(403).json({
+        error: roles.length > 1
+          ? `Accès réservé à un rôle autorisé : ${roles.join(", ")}.`
+          : `Accès réservé au rôle ${roles[0] ?? "autorisé"}.`,
+      });
+      return;
+    }
+    next();
+  };
 };
+
+export const requirePermission = (...permissions: string[]): RequestHandler => {
+  return (_request, response, next) => {
+    const user = response.locals.sessionUser as SessionUser | undefined;
+    if (!user || !hasPermission(user, ...permissions)) {
+      response.status(403).json({
+        error: permissions.length > 1
+          ? `Permissions requises : ${permissions.join(", ")}.`
+          : `Permission requise : ${permissions[0] ?? "non définie"}.`,
+      });
+      return;
+    }
+    next();
+  };
+};
+
+export const requireOwner = requireRole("Propriétaire");
 
 export const requireTrustedOrigin: RequestHandler = (request, response, next) => {
   const origin = request.get("origin");

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { pool } from "../db.js";
-import { assertAuthSecret, clearSessionCookie, requireAuth, setSessionCookie } from "../utils/authSession.js";
+import { assertAuthSecret, clearSessionCookie, normalizePermissions, requireAuth, setSessionCookie } from "../utils/authSession.js";
 import { hashPassword, verifyPassword } from "../utils/password.js";
 
 interface UserRow {
@@ -15,7 +15,10 @@ interface UserRow {
   password: string;
 }
 
-const safeUser = ({ password: _password, ...user }: UserRow) => user;
+const safeUser = ({ password: _password, ...user }: UserRow) => ({
+  ...user,
+  permissions: normalizePermissions(user.permissions),
+});
 const router = Router();
 
 export function normalizeRegistrationInput(body: unknown) {

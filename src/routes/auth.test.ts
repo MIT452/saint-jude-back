@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { normalizeRegistrationInput } from "./auth.js";
+import { hasPermission, hasRole, normalizePermissions } from "../utils/authSession.js";
 
 test("normalise les champs du formulaire de création de compte", () => {
   assert.deepEqual(normalizeRegistrationInput({
@@ -26,4 +27,18 @@ test("préserve le contrat historique name/tel", () => {
     tel: "034",
     password: "",
   });
+});
+
+test("normalise les permissions JSON en tableau exploitable", () => {
+  assert.deepEqual(normalizePermissions('["reservations:read","users:write"]'), ["reservations:read", "users:write"]);
+  assert.deepEqual(normalizePermissions(["reservations:read", "users:write"]), ["reservations:read", "users:write"]);
+  assert.deepEqual(normalizePermissions(undefined), []);
+});
+
+test("détermine rapidement les rôles et permissions d’un utilisateur", () => {
+  const user = { role: "Propriétaire", permissions: ["reservations:read", "users:write"] };
+  assert.equal(hasRole(user, "Propriétaire", "Agent"), true);
+  assert.equal(hasRole(user, "Agent"), false);
+  assert.equal(hasPermission(user, "reservations:read"), true);
+  assert.equal(hasPermission(user, "boats:delete"), false);
 });
