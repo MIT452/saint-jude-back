@@ -1,11 +1,16 @@
 import { Pool } from 'pg';
 import 'dotenv/config';
 
-const ssl = process.env.DB_SSL === 'true' ? { rejectUnauthorized: true } : undefined;
+const connectionString = process.env.DATABASE_URL;
+const databaseHost = connectionString ? new URL(connectionString).hostname : '';
+const isNeon = databaseHost.endsWith('.neon.tech');
+const ssl = process.env.DB_SSL === 'true' || isNeon
+  ? { rejectUnauthorized: process.env.DB_SSL_REJECT_UNAUTHORIZED !== 'false' }
+  : undefined;
 
 export const pool = new Pool({
-  ...(process.env.DATABASE_URL
-    ? { connectionString: process.env.DATABASE_URL }
+  ...(connectionString
+    ? { connectionString }
     : {
         host: process.env.DB_HOST ?? 'localhost',
         port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 5432,

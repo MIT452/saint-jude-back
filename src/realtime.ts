@@ -3,7 +3,7 @@ import { Server } from 'socket.io';
 
 let io: Server | null = null;
 
-export function initRealtime(http: HttpServer, origin: string) {
+export function initRealtime(http: HttpServer, origin: string | string[]) {
   io = new Server(http, { cors: { origin } });
   io.on('connection', (socket) => {
     console.log('Client temps réel connecté', socket.id);

@@ -102,3 +102,61 @@ n'a été créé par l'application.
   `DELETE/:id`), avec des colonnes PostgreSQL qui reprennent les mêmes noms de champs que vos
   interfaces TypeScript (`Goods`, `Reservation`, `Trip`, `Boat`, `CashMovement`,
   `FuelConsumption`, `User`) — aucune adaptation du code frontend n'est donc nécessaire.
+
+## Inscription, connexion et Neon
+
+Le frontend utilise `POST /api/auth/register`, `POST /api/auth/login`, `GET /api/auth/me` et
+`POST /api/auth/logout`. Les mots de passe sont hachés avec scrypt dans la table `user`; la session
+est conservée dans un cookie `HttpOnly`, jamais dans `localStorage`. Une inscription publique crée
+uniquement un compte `Agent`.
+
+Pour utiliser Neon, configurez les variables dans le `.env` du backend (ou dans les variables
+secrètes de l’hébergeur) :
+
+```env
+DATABASE_URL=postgresql://...   # URL Neon, ne pas committer
+DB_SSL=true                  # Neon utilise TLS (détection automatique aussi)
+AUTH_SECRET=                    # secret aléatoire d'au moins 32 caractères
+CORS_ORIGIN=http://localhost:5173
+```
+
+Important : si `DATABASE_URL` est vide, le backend utilise les variables `DB_HOST`, `DB_PORT`,
+`DB_USER`, `DB_PASSWORD` et `DB_NAME` et écrit donc dans cette base locale, pas dans Neon. Vérifiez
+`http://localhost:3000/api/health/database` : `provider` doit valoir `neon` et `status` `ok`.
+Cette vérification confirme également que la table `user` existe.
+
+Configurez `VITE_API_URL=http://localhost:3000/api` dans le frontend en développement. En
+production, remplacez-la par l’URL publique du backend et ajoutez l’origine exacte du frontend à
+`CORS_ORIGIN`. Les cookies nécessitent `credentials` côté API et navigateur. Après avoir créé votre
+compte, un administrateur de la base peut attribuer le rôle propriétaire au premier compte de
+confiance dans Neon :
+
+```sql
+UPDATE "user" SET role = 'Propriétaire' WHERE email = 'votre-email@example.com';
+```
+
+Appliquez `schema-postgresql.sql` à la base Neon avant l’inscription. Ne mettez jamais `DATABASE_URL`
+ou `AUTH_SECRET` dans le frontend ni dans Git.
+
+## Capacités IA avancées
+
+Les routes complémentaires sont sous `/api/ai-advanced` :
+
+- `POST /rag` recherche les documents; `POST /rag/documents` les ajoute ou les met à jour.
+- `POST /mcp` expose `initialize`, `ping`, `tools/list` et `tools/call` en JSON-RPC.
+- `POST /evaluate/suite` lance les fixtures de référence.
+- `GET /observability/metrics` renvoie les compteurs par route et leur latence moyenne.
+- `POST /approvals`, `GET /approvals` et `PATCH /approvals/:id` gèrent les validations humaines.
+- `POST /speech/transcribe` et `POST /speech/synthesize` utilisent les API audio OpenAI.
+
+Appliquez `schema-postgresql.sql` après chaque mise à jour du schéma. Pour activer les embeddings,
+renseignez `OPENAI_API_KEY`; sans clé, l’ingestion et la recherche utilisent le texte intégral
+PostgreSQL. Les embeddings sont comparés en mémoire, ce qui convient à un corpus limité (2 000
+documents) ; une base plus volumineuse doit migrer vers pgvector.
+
+Définissez des secrets aléatoires non vides dans `MCP_BEARER_TOKEN`, `RAG_ADMIN_TOKEN`,
+`OBSERVABILITY_TOKEN` et `AI_APPROVAL_TOKEN`. Passez-les comme en-tête `Authorization: Bearer <secret>`
+sur les routes protégées. Ne réutilisez pas ces secrets entre environnements.
+
+La suite actuelle est un smoke test déterministe, pas une évaluation sémantique d’un LLM. Le
+frontend n’est pas dans ce dépôt; il faut relier ses écrans au projet frontend séparé.

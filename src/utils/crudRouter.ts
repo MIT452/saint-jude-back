@@ -2,9 +2,14 @@ import { Router } from 'express';
 import type { QueryResultRow } from 'pg';
 import { v4 as uuid } from 'uuid';
 import { pool } from '../db.js';
+import { hashPassword } from './password.js';
 
 export interface CrudOptions {
   table: string;
+  // Champs qui ne doivent jamais être renvoyés au client
+  omitFields?: string[];
+  // Champs à hacher avant insertion ou mise à jour
+  hashFields?: string[];
   // Colonnes booléennes à exposer/recevoir comme booléens JS
   booleanFields?: string[];
   // Colonnes JSON à sérialiser automatiquement avant l'écriture
@@ -13,13 +18,14 @@ export interface CrudOptions {
 
 function rowOut(row: QueryResultRow, opts: CrudOptions) {
   const out: Record<string, unknown> = { ...row };
+  for (const field of opts.omitFields ?? []) delete out[field];
   for (const f of opts.booleanFields ?? []) {
     if (f in out) out[f] = !!out[f];
   }
   return out;
 }
 
-function rowIn(body: Record<string, unknown>, opts: CrudOptions) {
+async function rowIn(body: Record<string, unknown>, opts: CrudOptions) {
   const out: Record<string, unknown> = { ...body };
   for (const f of opts.booleanFields ?? []) {
     if (f in out) out[f] = Boolean(out[f]);
@@ -28,6 +34,12 @@ function rowIn(body: Record<string, unknown>, opts: CrudOptions) {
     const v = out[f];
     if (v !== undefined && v !== null && typeof v !== 'string') {
       out[f] = JSON.stringify(v);
+    }
+  }
+  for (const f of opts.hashFields ?? []) {
+    const value = out[f];
+    if (typeof value === 'string' && value && !value.startsWith('scrypt$')) {
+      out[f] = await hashPassword(value);
     }
   }
   return out;
@@ -71,7 +83,7 @@ export function createCrudRouter(opts: CrudOptions) {
   // POST /api/<table> — le frontend envoie déjà un objet complet (id généré côté client via uuid)
   router.post('/', async (req, res) => {
     try {
-      const body = rowIn(req.body ?? {}, opts);
+      const body = await rowIn(req.body ?? {}, opts);
       if (!body.id) body.id = uuid();
       const columns = Object.keys(body);
       if (columns.length === 0) {
@@ -93,7 +105,7 @@ export function createCrudRouter(opts: CrudOptions) {
   // PUT /api/<table>/:id
   router.put('/:id', async (req, res) => {
     try {
-      const body = rowIn(req.body ?? {}, opts);
+      const body = await rowIn(req.body ?? {}, opts);
       delete body.id;
       const columns = Object.keys(body);
       if (columns.length === 0) {

@@ -99,6 +99,30 @@ CREATE TABLE IF NOT EXISTS fuelconsumptions (
   "createdAt" TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS knowledge_documents (
+  id VARCHAR(36) PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  tags TEXT[] NOT NULL DEFAULT '{}',
+  embedding JSONB,
+  "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  search_vector TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', title || ' ' || content)) STORED
+);
+
+ALTER TABLE knowledge_documents ADD COLUMN IF NOT EXISTS embedding JSONB;
+
+CREATE TABLE IF NOT EXISTS ai_approval_requests (
+  id VARCHAR(36) PRIMARY KEY,
+  "requestType" VARCHAR(100) NOT NULL,
+  payload JSONB NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  "requestedBy" VARCHAR(255),
+  "reviewedBy" VARCHAR(255),
+  "reviewNote" TEXT,
+  "createdAt" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "reviewedAt" TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_boats_userid ON boats ("userId");
 CREATE INDEX IF NOT EXISTS idx_trips_boatid ON trips ("boatId");
 CREATE INDEX IF NOT EXISTS idx_trips_userid ON trips ("userId");
@@ -109,6 +133,14 @@ CREATE INDEX IF NOT EXISTS idx_goods_tripid ON goods ("tripId");
 CREATE INDEX IF NOT EXISTS idx_cashmovements_tripid ON cashmovements ("tripId");
 CREATE INDEX IF NOT EXISTS idx_cashmovements_goodsid ON cashmovements ("goodsId");
 CREATE INDEX IF NOT EXISTS idx_fuelconsumptions_tripid ON fuelconsumptions ("tripId");
+CREATE INDEX IF NOT EXISTS idx_knowledge_documents_search ON knowledge_documents USING GIN (search_vector);
+CREATE INDEX IF NOT EXISTS idx_ai_approval_status_created ON ai_approval_requests (status, "createdAt");
+
+INSERT INTO knowledge_documents (id, title, content, tags)
+VALUES
+  ('reservation-policy', 'Politique de réservation', 'Les réservations de marchandises sont enregistrées avec quantité, poids, date et statut de paiement.', ARRAY['réservation', 'marchandises']),
+  ('capacity-policy', 'Capacité des bateaux', 'La capacité disponible est la capacité totale moins les places déjà réservées.', ARRAY['capacité', 'bateau'])
+ON CONFLICT (id) DO NOTHING;
 
 -- No demo user is inserted here. Create users through a secure application flow;
 -- Never store a plain-text demo password.

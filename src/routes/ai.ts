@@ -5,7 +5,7 @@ export const aiRouter = Router();
 
 // Limite simple : 10 requêtes par minute et par IP (le LLM consomme beaucoup de CPU)
 const hits = new Map<string, number[]>();
-function limiter(req: Request, res: Response, next: NextFunction) {
+export function aiRequestLimiter(req: Request, res: Response, next: NextFunction) {
   const now = Date.now();
   const ip = req.ip ?? 'inconnu';
   const recent = (hits.get(ip) ?? []).filter((t) => now - t < 60_000);
@@ -15,7 +15,7 @@ function limiter(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
-aiRouter.post('/chat', limiter, async (req, res) => {
+aiRouter.post('/chat', aiRequestLimiter, async (req, res) => {
   const question = String(req.body?.question ?? '').trim().slice(0, 500);
   if (!question) return res.status(400).json({ error: 'question requise' });
   try {
