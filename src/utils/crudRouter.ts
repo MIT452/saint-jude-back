@@ -49,6 +49,20 @@ function quoteIdentifier(identifier: string) {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
 
+// TEMPORAIRE (débogage) : renvoie le message PostgreSQL au client.
+// À retirer une fois le bug réglé, ces détails sont internes.
+function errorBody(err: unknown, message: string) {
+  const e = err as { message?: string; detail?: string; code?: string; column?: string; constraint?: string };
+  return {
+    error: message,
+    message: e?.message,
+    detail: e?.detail,
+    code: e?.code,
+    column: e?.column,
+    constraint: e?.constraint,
+  };
+}
+
 export function createCrudRouter(opts: CrudOptions) {
   const router = Router();
   const { table } = opts;
@@ -61,7 +75,7 @@ export function createCrudRouter(opts: CrudOptions) {
       res.json(rows.map((r) => rowOut(r, opts)));
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: `Erreur lors de la lecture de ${table}` });
+      res.status(500).json(errorBody(err, `Erreur lors de la lecture de ${table}`));
     }
   });
 
@@ -76,7 +90,7 @@ export function createCrudRouter(opts: CrudOptions) {
       res.json(rowOut(rows[0], opts));
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: `Erreur lors de la lecture de ${table}` });
+      res.status(500).json(errorBody(err, `Erreur lors de la lecture de ${table}`));
     }
   });
 
@@ -98,7 +112,7 @@ export function createCrudRouter(opts: CrudOptions) {
       res.status(201).json(rowOut(rows[0], opts));
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: `Erreur lors de la création dans ${table}` });
+      res.status(500).json(errorBody(err, `Erreur lors de la création dans ${table}`));
     }
   });
 
@@ -123,7 +137,7 @@ export function createCrudRouter(opts: CrudOptions) {
       res.json(rowOut(rows[0], opts));
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: `Erreur lors de la mise à jour dans ${table}` });
+      res.status(500).json(errorBody(err, `Erreur lors de la mise à jour dans ${table}`));
     }
   });
 
@@ -138,7 +152,7 @@ export function createCrudRouter(opts: CrudOptions) {
       res.json({ id: req.params.id });
     } catch (err) {
       console.error(err);
-      res.status(500).json({ error: `Erreur lors de la suppression dans ${table}` });
+      res.status(500).json(errorBody(err, `Erreur lors de la suppression dans ${table}`));
     }
   });
 
