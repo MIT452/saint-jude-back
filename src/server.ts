@@ -18,6 +18,7 @@ import { traceRequest } from './ai/observability.js';
 import authRouter from './routes/auth.js';
 import { requireAuth, requireOwner, requireTrustedOrigin } from './utils/authSession.js';
 import { pool } from './db.js';
+import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
 
 const app = express();
 
@@ -73,6 +74,13 @@ app.get('/api/health/database', async (_req, res) => {
 });
 
 app.use('/api/auth', authRouter);
+
+/* =========================
+   GARDE-FOU DE CAPACITÉ
+   Doit rester AVANT toutes les routes /api/reservations
+========================= */
+
+app.post('/api/reservations', requireAuth, checkCapacity); // AJOUT 2/2
 
 /* =========================
    CRUD ROUTES
@@ -161,8 +169,7 @@ app.use('/api/ai', requireAuth, aiRouter);
 
 app.use('/api/ai-capabilities', requireAuth, aiCapabilitiesRouter);
 
-app.use('/api/ai-advanced', advancedAiRouter);
-
+app.use('/api/ai-advanced', requireAuth, advancedAiRouter);
 app.use('/api/positions', requireAuth, positionsRouter);
 
 app.use('/api/optimization', requireAuth, optimizationRouter);
