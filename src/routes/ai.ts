@@ -414,7 +414,7 @@ function computeTotals(d: Draft) {
 }
 
 /* =========================================================
-   LLM Provider (Ollama local / Groq ou OpenAI en prod)
+   LLM Provider (Ollama local / OpenAI ou Groq en prod)
 ========================================================= */
 interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -422,7 +422,10 @@ interface ChatMessage {
 }
 
 interface LLMProvider {
-  chat(messages: ChatMessage[], options?: { temperature?: number; maxTokens?: number }): Promise<string>;
+  chat(
+    messages: ChatMessage[],
+    options?: { temperature?: number; maxTokens?: number },
+  ): Promise<string>;
 }
 
 class OllamaProvider implements LLMProvider {
@@ -442,9 +445,50 @@ class OllamaProvider implements LLMProvider {
         },
       }),
     });
+
     if (!res.ok) throw new Error(`Ollama ${res.status}`);
-    const data = await res.json();
+
+    const data = (await res.json()) as {
+      message?: { content?: string };
+    };
+
     return data.message?.content ?? '';
+  }
+}
+
+class OpenAIProvider implements LLMProvider {
+  constructor(
+    private apiKey = process.env.OPENAI_API_KEY!,
+    private model = process.env.OPENAI_MODEL || 'gpt-4o-mini',
+    private baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
+  ) {}
+
+  async chat(messages: ChatMessage[], options = {}) {
+    const res = await fetch(`${this.baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: this.model,
+        messages,
+        temperature: options.temperature ?? 0.05,
+        max_tokens: options.maxTokens ?? 512,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OpenAI ${res.status}: ${err}`);
+    }
+
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+
+    return data.choices?.[0]?.message?.content ?? '';
   }
 }
 
@@ -466,53 +510,34 @@ class GroqProvider implements LLMProvider {
         response_format: { type: 'json_object' },
       }),
     });
+
     if (!res.ok) {
       const err = await res.text();
       throw new Error(`Groq ${res.status}: ${err}`);
     }
-    const data = await res.json();
-    return data.choices[0]?.message?.content ?? '';
-  }
-}
 
-class OpenAIProvider implements LLMProvider {
-  constructor(private apiKey = process.env.OPENAI_API_KEY!) {}
+    const data = (await res.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
 
-  async chat(messages: ChatMessage[], options = {}) {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
-        messages,
-        temperature: options.temperature ?? 0.05,
-        max_tokens: options.maxTokens ?? 512,
-        response_format: { type: 'json_object' },
-      }),
-    });
-    if (!res.ok) {
-      const err = await res.text();
-      throw new Error(`OpenAI ${res.status}: ${err}`);
-    }
-    const data = await res.json();
-    return data.choices[0]?.message?.content ?? '';
+    return data.choices?.[0]?.message?.content ?? '';
   }
 }
 
 function createLLMProvider(): LLMProvider {
-  const provider = process.env.AI_PROVIDER?.toLowerCase();
+  const provider = (process.env.AI_PROVIDER || '').toLowerCase();
   const env = process.env.NODE_ENV || 'development';
 
-  if (provider === 'ollama' || (env === 'development' && !provider)) {
-    return new OllamaProvider();
-  }
-  if (provider === 'openai') {
-    return new OpenAIProvider();
-  }
-  return new GroqProvider(); // défaut production
+  if (provider === 'ollama') return new OllamaProvider();
+  if (provider === 'groq' && process.env.GROQ_API_KEY) return new GroqProvider();
+  if (provider === 'openai' && process.env.OPENAI_API_KEY) return new OpenAIProvider();
+
+  // Fallback intelligent
+  if (env === 'development') return new OllamaProvider();
+  if (process.env.OPENAI_API_KEY) return new OpenAIProvider();
+  if (process.env.GROQ_API_KEY) return new GroqProvider();
+
+  return new OllamaProvider();
 }
 
 const SYSTEM_PROMPT = `Tu es l'assistant de réservation de Saint-Jude (transport maritime Madagascar).
@@ -666,7 +691,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       console.warn('LLM indisponible → fallback déterministe', err);
     }
 
-    // Fallback déterministe si LLM a échoué ou a peu extrait
+    // Fallback déterministe
     if (!llmOk) {
       const goods = extractGoods(text, places);
       if (goods.cargoType) draft.cargoType = goods.cargoType;
