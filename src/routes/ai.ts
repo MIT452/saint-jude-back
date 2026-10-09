@@ -105,12 +105,14 @@ const TRIP_FILTER = `LOWER(t."from") LIKE $1 AND LOWER(t."to") LIKE $2`;
 export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
   const params = [`%${i.depart.toLowerCase()}%`, `%${i.arrivee.toLowerCase()}%`, i.date];
 
+  // Les réservations annulées ou refusées ne consomment pas de capacité
   const { rows } = await pool.query(
     `SELECT t.id, t.price_per_kg, b.name AS boat_name, b.capacity,
             COALESCE((SELECT SUM(r.weight) FROM reservations r
                       WHERE r."tripId" = t.id
                         AND UPPER(r.status) NOT LIKE 'ANNUL%'
-                        AND UPPER(r.status) NOT LIKE 'CANCEL%'), 0) AS used
+                        AND UPPER(r.status) NOT LIKE 'CANCEL%'
+                        AND UPPER(r.status) NOT LIKE 'REFUS%'), 0) AS used
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
@@ -421,17 +423,19 @@ interface ChatMessage {
   content: string;
 }
 
+interface LLMOptions {
+  temperature?: number;
+  maxTokens?: number;
+}
+
 interface LLMProvider {
-  chat(
-    messages: ChatMessage[],
-    options?: { temperature?: number; maxTokens?: number },
-  ): Promise<string>;
+  chat(messages: ChatMessage[], options?: LLMOptions): Promise<string>;
 }
 
 class OllamaProvider implements LLMProvider {
   constructor(private model = process.env.OLLAMA_MODEL || 'llama3.2') {}
 
-  async chat(messages: ChatMessage[], options = {}) {
+  async chat(messages: ChatMessage[], options: LLMOptions = {}) {
     const res = await fetch('http://localhost:11434/api/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -463,7 +467,7 @@ class OpenAIProvider implements LLMProvider {
     private baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
   ) {}
 
-  async chat(messages: ChatMessage[], options = {}) {
+  async chat(messages: ChatMessage[], options: LLMOptions = {}) {
     const res = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -495,7 +499,7 @@ class OpenAIProvider implements LLMProvider {
 class GroqProvider implements LLMProvider {
   constructor(private apiKey = process.env.GROQ_API_KEY!) {}
 
-  async chat(messages: ChatMessage[], options = {}) {
+  async chat(messages: ChatMessage[], options: LLMOptions = {}) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -590,6 +594,8 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     // ---- Confirmation oui/non
     if (draft.awaitingConfirm && isYes(question)) {
       const total = draft.totalWeightKg;
+      let reservationId: string | null = null; // CORRIGÉ : sert à prévenir le front
+
       if (!draft.tripId || !draft.departure || !draft.destination || !draft.dateExact || !total) {
         draft.awaitingConfirm = false;
         reply =
@@ -602,23 +608,57 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
           date: draft.dateExact,
           poidsTotalKg: total,
         });
+
         if (!check.available) {
           draft.awaitingConfirm = false;
           reply = check.message ?? 'Ce trajet n’est plus disponible.';
         } else {
           const clientName = String(req.body?.clientName ?? 'Client IA');
-          const insertRes = await pool.query(
-            `INSERT INTO reservations (id, "clientName", "tripId", quantity, weight, "totalPrice", status, "createdAt")
-             VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'PENDING', NOW())
-             RETURNING id;`,
-            [clientName, check.tripId, draft.quantity || 1, total, check.totalPrice ?? 0],
-          );
-          reply = `Merci ! Votre réservation a été enregistrée avec succès sous le numéro #${String(insertRes.rows[0].id).slice(0, 8)}.`;
+
+          // CORRIGÉ : transaction (tout est créé ou rien)
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+
+            // CORRIGÉ : statut 'EN_ATTENTE' (attendu par le front) au lieu de 'PENDING'
+            const insertRes = await client.query(
+              `INSERT INTO reservations (id, "clientName", "tripId", quantity, weight, "totalPrice", status, "createdAt")
+               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'EN_ATTENTE', NOW())
+               RETURNING id;`,
+              [clientName, check.tripId, draft.quantity || 1, total, check.totalPrice ?? 0],
+            );
+            reservationId = String(insertRes.rows[0].id);
+
+            // --- À ACTIVER après avoir vérifié les colonnes réelles de la table goods ---
+            // await client.query(
+            //   `INSERT INTO goods (id, "reservationId", name, quantity, weight)
+            //    VALUES (gen_random_uuid(), $1, $2, $3, $4);`,
+            //   [reservationId, draft.cargoType ?? 'Marchandise', draft.quantity || 1, total],
+            // );
+
+            await client.query('COMMIT');
+          } catch (txError) {
+            await client.query('ROLLBACK');
+            throw txError;
+          } finally {
+            client.release();
+          }
+
+          reply = `Merci ! Votre réservation a été enregistrée avec succès sous le numéro #${reservationId.slice(0, 8)}.`;
           draft.confirmedByUser = true;
           draft.awaitingConfirm = false;
         }
       }
-      return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+
+      // CORRIGÉ : indicateurs pour que le front recharge le tableau
+      return res.json({
+        reply,
+        reponse: reply,
+        updatedContext: draft,
+        quoteSummary,
+        reservationCreated: reservationId !== null,
+        reservationId,
+      });
     }
     if (draft.awaitingConfirm && isNo(question)) {
       draft.awaitingConfirm = false;
