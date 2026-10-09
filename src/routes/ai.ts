@@ -349,6 +349,18 @@ const isPureGreeting = (t: string) =>
     strip(t),
   );
 
+/** Bavardage (« tu vas bien ? », « ça va », « merci »…) : pas une réponse à la question en cours. */
+const isSmallTalk = (t: string) =>
+  /^(tu vas bien|vous allez bien|ca va|ca va bien|comment (ca va|vas[- ]tu|tu vas|allez[- ]vous|vous allez)|merci|merci beaucoup|ok merci|super|cool)[\s!?.,;]*$/.test(
+    strip(t),
+  );
+
+/** Mots d'une conversation, jamais d'une marchandise. */
+const CHAT_WORDS = new Set([
+  'tu', 'vous', 'je', 'moi', 'toi', 'comment', 'pourquoi', 'quoi', 'qui', 'quand', 'ca',
+  'va', 'vas', 'vais', 'allez', 'est', 'es', 'suis', 'etes', 'bien', 'merci', 'svp',
+]);
+
 const NOT_CARGO = new Set([
   'bonjour', 'bonjours', 'bonsoir', 'salut', 'coucou', 'hello', 'hi', 'allo', 'salam',
   'merci', 'svp', 'ok', 'okay', 'oui', 'non', 'test', 'aide', 'help',
@@ -360,7 +372,9 @@ const isValidCargo = (s: unknown, places: string[]): s is string => {
   if (typeof s !== 'string') return false;
   const k = strip(s).replace(/[^\p{L}\p{N}\s'-]/gu, '').trim();
   if (k.length < 3) return false;
-  if (NOT_CARGO.has(k) || isPureGreeting(k)) return false;
+  if (NOT_CARGO.has(k) || isPureGreeting(k) || isSmallTalk(k)) return false;
+  if (/\?/.test(s)) return false;
+  if (k.split(/\s+/).some((w) => CHAT_WORDS.has(w))) return false;
   if (places.some((p) => strip(p) === k)) return false;
   return true;
 };
@@ -727,13 +741,14 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     }
 
     // ---- 0. Salutation seule : on répond poliment et on repose la question en cours
-    if (isPureGreeting(question)) {
+    if (isPureGreeting(question) || isSmallTalk(question)) {
       const q0 = nextQuestion(draft);
       if (q0) draft.asked = q0.field;
       const rest = q0 ? q0.text.replace(/^(D’accord|Très bien)[^!.]*[!.]\s*/, '') : '';
+      const hello = isSmallTalk(question) ? 'Je vais bien, merci !' : 'Bonjour !';
       reply = rest
-        ? `Bonjour ! Je vous aide à préparer votre réservation. ${rest}`
-        : 'Bonjour ! Dites-moi ce que vous souhaitez envoyer, vers où et à quelle date.';
+        ? `${hello} Je vous aide à préparer votre réservation. ${rest}`
+        : `${hello} Dites-moi ce que vous souhaitez envoyer, vers où et à quelle date.`;
       return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
     }
 
