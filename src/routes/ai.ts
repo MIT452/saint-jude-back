@@ -495,7 +495,9 @@ class OllamaProvider implements LLMProvider {
   constructor(private model = process.env.OLLAMA_MODEL || 'llama3.2') {}
 
   async chat(messages: ChatMessage[], options: LLMOptions = {}) {
-    const res = await fetch('http://localhost:11434/api/chat', {
+    // CORRIGÉ : 127.0.0.1 au lieu de localhost (Node résout parfois localhost en IPv6 ::1,
+    // alors qu'Ollama écoute seulement en IPv4 → « fetch failed »)
+    const res = await fetch(`${process.env.OLLAMA_URL || 'http://127.0.0.1:11434'}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -816,7 +818,8 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       }
       llmOk = true;
     } catch (err) {
-      console.warn('LLM indisponible → fallback déterministe', err);
+      const detail = err instanceof Error ? `${err.message} | cause: ${String((err as any).cause ?? '-')}` : String(err);
+      console.warn(`[IA] LLM indisponible → fallback déterministe : ${detail}`);
     }
 
     // Fallback déterministe
