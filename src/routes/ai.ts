@@ -1,3 +1,4 @@
+// src/routes/ai.ts
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { pool } from '../db.js';
 
@@ -11,35 +12,50 @@ export function aiRequestLimiter(req: Request, res: Response, next: NextFunction
   const now = Date.now();
   const ip = req.ip ?? 'inconnu';
   const recent = (hits.get(ip) ?? []).filter((t) => now - t < 60_000);
-  if (recent.length >= 10) return res.status(429).json({ error: 'Trop de requêtes, réessayez dans une minute.' });
+  if (recent.length >= 10) {
+    return res.status(429).json({ error: 'Trop de requêtes, réessayez dans une minute.' });
+  }
   recent.push(now);
   hits.set(ip, recent);
   if (hits.size > 5000) {
-    for (const [k, v] of hits) if (!v.some((t) => now - t < 60_000)) hits.delete(k);
+    for (const [k, v] of hits) {
+      if (!v.some((t) => now - t < 60_000)) hits.delete(k);
+    }
   }
   next();
 }
 
 /* =========================================================
-   Dates (fuseau de Madagascar, pas celui du serveur)
+   Dates (fuseau de Madagascar)
 ========================================================= */
 const TZ = 'Indian/Antananarivo';
 const DAY_NAMES = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
 
-const strip = (s: string) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
-const todayLocal = () => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date()); // YYYY-MM-DD
+const strip = (s: string) =>
+  s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+
+const todayLocal = () =>
+  new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date()); // YYYY-MM-DD
+
 const addDays = (isoDate: string, n: number) => {
   const d = new Date(`${isoDate}T12:00:00Z`);
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
 };
+
 const formatFr = (isoDate: string) =>
   new Date(`${isoDate}T12:00:00Z`).toLocaleDateString('fr-FR', {
-    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC',
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+    timeZone: 'UTC',
   });
 
-/** null si le texte ne contient aucune date ; ambiguous = « vendredi » dit un vendredi. */
-export function parseRelativeDate(text: string): { dateStr: string; formatted: string; ambiguous: boolean } | null {
+/** null si aucune date ; ambiguous = « vendredi » dit un vendredi. */
+export function parseRelativeDate(
+  text: string,
+): { dateStr: string; formatted: string; ambiguous: boolean } | null {
   const t = strip(text);
   const today = todayLocal();
   let target: string | null = null;
@@ -55,7 +71,10 @@ export function parseRelativeDate(text: string): { dateStr: string; formatted: s
     if (m) {
       const todayIdx = new Date(`${today}T12:00:00Z`).getUTCDay();
       let diff = (DAY_NAMES.indexOf(m[1]) - todayIdx + 7) % 7;
-      if (diff === 0) { diff = 7; ambiguous = !m[2]; }
+      if (diff === 0) {
+        diff = 7;
+        ambiguous = !m[2];
+      }
       target = addDays(today, diff);
     }
   }
@@ -63,7 +82,7 @@ export function parseRelativeDate(text: string): { dateStr: string; formatted: s
 }
 
 /* =========================================================
-   Vérification trajets / capacité / tarifs (source de vérité : la base)
+   Vérification trajets / capacité / tarifs (source de vérité)
 ========================================================= */
 export interface VerifyInput {
   depart: string;
@@ -72,6 +91,7 @@ export interface VerifyInput {
   poidsTotalKg?: number;
   passagers?: number;
 }
+
 export interface VerifyResult {
   available: boolean;
   totalPrice?: number;
@@ -98,7 +118,6 @@ export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
     params,
   );
 
-  // Aucun voyage ce jour-là → on propose le prochain départ
   if (rows.length === 0) {
     const next = await pool.query(
       `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day
@@ -115,9 +134,10 @@ export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
     };
   }
 
-  // Capacité (marchandises uniquement)
   const needKg = i.poidsTotalKg ?? 0;
-  const trip = rows.find((r) => r.capacity == null || Number(r.capacity) - Number(r.used) >= needKg);
+  const trip = rows.find(
+    (r) => r.capacity == null || Number(r.capacity) - Number(r.used) >= needKg,
+  );
   if (!trip) {
     const left = Math.max(0, Number(rows[0].capacity) - Number(rows[0].used));
     return {
@@ -126,7 +146,6 @@ export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
     };
   }
 
-  // Tarif : jamais inventé (aucune valeur par défaut)
   const pricePerKg = Number(trip.price_per_kg);
   if (needKg > 0 && !(pricePerKg > 0)) {
     return { available: false, message: 'Le tarif de ce voyage n’est pas encore défini.' };
@@ -143,7 +162,9 @@ export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
 aiRouter.post('/verify', aiRequestLimiter, async (req: Request, res: Response) => {
   try {
     const { depart, arrivee, date, poidsTotalKg, passagers } = req.body ?? {};
-    if (!depart || !arrivee || !date) return res.status(400).json({ error: 'depart, arrivee et date requis' });
+    if (!depart || !arrivee || !date) {
+      return res.status(400).json({ error: 'depart, arrivee et date requis' });
+    }
     return res.json(await verifyTrip({ depart, arrivee, date, poidsTotalKg, passagers }));
   } catch (error) {
     console.error('Erreur /verify:', error);
@@ -152,15 +173,13 @@ aiRouter.post('/verify', aiRequestLimiter, async (req: Request, res: Response) =
 });
 
 /* =========================================================
-   Dialogue /chat (marchandises) : le client parle librement.
-   Rien n'est imposé : marchandise, unité, quantité, ports et dates
-   viennent uniquement du client. Les ports sont lus en base.
+   Draft & extraction déterministe (fallback)
 ========================================================= */
 interface Draft {
-  cargoType?: string; // texte libre (« vêtements », « farine »...)
-  unit?: string; // texte libre, singulier
+  cargoType?: string;
+  unit?: string;
   quantity?: number;
-  weightKg?: number; // poids tel que donné
+  weightKg?: number;
   weightMode?: 'unit' | 'total';
   unitWeightKg?: number;
   totalWeightKg?: number;
@@ -178,22 +197,35 @@ interface Draft {
 }
 
 let placesCache = { at: 0, list: [] as string[] };
+
 async function getKnownPlaces(): Promise<string[]> {
-  if (placesCache.list.length && Date.now() - placesCache.at < 60_000) return placesCache.list;
-  const { rows } = await pool.query(`SELECT DISTINCT "from" AS name FROM trips UNION SELECT DISTINCT "to" AS name FROM trips`);
-  const list = rows.map((r) => String(r.name ?? '').trim()).filter(Boolean).sort((a, b) => b.length - a.length);
+  if (placesCache.list.length && Date.now() - placesCache.at < 60_000) {
+    return placesCache.list;
+  }
+  const { rows } = await pool.query(
+    `SELECT DISTINCT "from" AS name FROM trips
+     UNION
+     SELECT DISTINCT "to" AS name FROM trips`,
+  );
+  const list = rows
+    .map((r) => String(r.name ?? '').trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
   placesCache = { at: Date.now(), list };
   return list;
 }
 
 const NUM_WORDS: Record<string, number> = {
-  un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5, six: 6, sept: 7, huit: 8, neuf: 9, dix: 10,
-  onze: 11, douze: 12, quinze: 15, vingt: 20, trente: 30, cinquante: 50, cent: 100,
+  un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5,
+  six: 6, sept: 7, huit: 8, neuf: 9, dix: 10,
+  onze: 11, douze: 12, quinze: 15, vingt: 20, trente: 30,
+  cinquante: 50, cent: 100,
 };
 const NUM_FR = ['zéro', 'un', 'deux', 'trois', 'quatre', 'cinq', 'six', 'sept', 'huit', 'neuf', 'dix'];
 const say = (n: number) => (n >= 0 && n <= 10 ? NUM_FR[n] : String(n));
 
-const UNIT = '(?:colis|sacs?|cartons?|caisses?|f[uû]ts?|bidons?|palettes?|paquets?|bo[iî]tes?|bouteilles?|balles?|ballots?|tonneaux?|conteneurs?|valises?|bagages?)';
+const UNIT =
+  '(?:colis|sacs?|cartons?|caisses?|f[uû]ts?|bidons?|palettes?|paquets?|bo[iî]tes?|bouteilles?|balles?|ballots?|tonneaux?|conteneurs?|valises?|bagages?)';
 const END = `(?![\\p{L}\\p{N}'’-])`;
 const BOUNDARY =
   '(?:à|a|au|aux|vers|depuis|de|du|pour|le|la|les|l|un|une|et|ou|avec|sans|sur|dans|en|pesant|chacun|chacune|chaque|par|total|poids|kg|kilos?|tonnes?|demain|apr[eè]s|aujourd|lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche)';
@@ -201,9 +233,13 @@ const WORD = `\\p{L}[\\p{L}'’-]*`;
 const GOODS = `((?!${BOUNDARY}${END})${WORD}(?:\\s+(?!${BOUNDARY}${END})${WORD}){0,2})`;
 
 function digitize(t: string): string {
-  const names = Object.keys(NUM_WORDS).filter((k) => k !== 'un' && k !== 'une').join('|');
+  const names = Object.keys(NUM_WORDS)
+    .filter((k) => k !== 'un' && k !== 'une')
+    .join('|');
   return t
-    .replace(new RegExp(`\\b(${names})(?=\\s+[a-zà-ÿ])`, 'gi'), (_m, w: string) => String(NUM_WORDS[w.toLowerCase()]))
+    .replace(new RegExp(`\\b(${names})(?=\\s+[a-zà-ÿ])`, 'gi'), (_m, w: string) =>
+      String(NUM_WORDS[w.toLowerCase()]),
+    )
     .replace(new RegExp(`\\b(?:un|une)(?=\\s+${UNIT}${END})`, 'giu'), '1');
 }
 
@@ -213,8 +249,10 @@ function singular(u: string): string {
   if (s.endsWith('eaux')) return s.slice(0, -1);
   return s.length > 3 && s.endsWith('s') ? s.slice(0, -1) : s;
 }
+
 const pluralize = (u: string, n: number) =>
   n <= 1 || u === 'colis' || /[sx]$/.test(u) ? u : u.endsWith('eau') ? `${u}x` : `${u}s`;
+
 const possessive = (m: string) => (/[sx]$/i.test(m) ? `vos ${m}` : `votre ${m}`);
 
 function extractGoods(textLower: string, places: string[]) {
@@ -228,11 +266,14 @@ function extractGoods(textLower: string, places: string[]) {
     if (um[1]) out.quantity = parseInt(um[1], 10);
   }
 
-  // « 3 colis de <X> »
-  const a = t.match(new RegExp(`\\b${UNIT}${END}\\s+(?:de\\s+|d['’]\\s*)(?:(?:la\\s+|le\\s+|les\\s+|l['’]\\s*|des\\s+|du\\s+))?${GOODS}`, 'iu'));
+  const a = t.match(
+    new RegExp(
+      `\\b${UNIT}${END}\\s+(?:de\\s+|d['’]\\s*)(?:(?:la\\s+|le\\s+|les\\s+|l['’]\\s*|des\\s+|du\\s+))?${GOODS}`,
+      'iu',
+    ),
+  );
   if (a && !isPlace(a[1])) out.cargoType = a[1].trim();
 
-  // « envoyer du <X> »
   if (!out.cargoType) {
     const b = t.match(
       new RegExp(
@@ -240,15 +281,23 @@ function extractGoods(textLower: string, places: string[]) {
         'iu',
       ),
     );
-    if (b && !isPlace(b[1]) && !new RegExp(`^${UNIT}${END}`, 'iu').test(b[1])) out.cargoType = b[1].trim();
+    if (b && !isPlace(b[1]) && !new RegExp(`^${UNIT}${END}`, 'iu').test(b[1])) {
+      out.cargoType = b[1].trim();
+    }
   }
   return out;
 }
 
-function extractRoute(text: string, places: string[], d: Draft, expecting?: Draft['asked']) {
+function extractRoute(
+  text: string,
+  places: string[],
+  d: Draft,
+  expecting?: Draft['asked'],
+) {
   const t = strip(text).replace(/’/g, "'");
   const found: Array<{ place: string; index: number; role?: 'departure' | 'destination' }> = [];
   const taken: Array<[number, number]> = [];
+
   for (const place of places) {
     const key = strip(place).replace(/’/g, "'");
     const esc = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -260,14 +309,18 @@ function extractRoute(text: string, places: string[], d: Draft, expecting?: Draf
     taken.push([index, end]);
     const before = t.slice(0, index).replace(/\s+/g, ' ').trimEnd();
     const role =
-      /(?:^|\s)(?:de|depuis)$|(?:^|\s)d'$/.test(before) ? 'departure'
-      : /(?:^|\s)(?:a|vers|pour|jusqu'a|au)(?:\s+(?:aller|rendre))?$/.test(before) ? 'destination'
-      : undefined;
+      /(?:^|\s)(?:de|depuis)$|(?:^|\s)d'$/.test(before)
+        ? 'departure'
+        : /(?:^|\s)(?:a|vers|pour|jusqu'a|au)(?:\s+(?:aller|rendre))?$/.test(before)
+          ? 'destination'
+          : undefined;
     found.push({ place, index, role });
   }
+
   found.sort((x, y) => x.index - y.index);
   let departure = found.find((f) => f.role === 'departure')?.place;
   let destination = found.find((f) => f.role === 'destination')?.place;
+
   for (const f of found.filter((x) => !x.role)) {
     if (expecting === 'departure' && !departure) departure = f.place;
     else if (expecting === 'destination' && !destination) destination = f.place;
@@ -277,23 +330,47 @@ function extractRoute(text: string, places: string[], d: Draft, expecting?: Draf
   return { departure, destination };
 }
 
-const isYes = (t: string) => /^(oui|ok|d'accord|confirme|confirmer|valide|valider)\b/.test(strip(t));
-const isNo = (t: string) => /^(non|no|nope|modifier|changer|corriger)\b/.test(strip(t));
+function found1(places: string[], loneNorm: string): string | undefined {
+  return places.find(
+    (p) => strip(p).replace(/’/g, "'") === loneNorm.replace(/’/g, "'"),
+  );
+}
+
+const isYes = (t: string) =>
+  /^(oui|ok|d'accord|confirme|confirmer|valide|valider)\b/.test(strip(t));
+const isNo = (t: string) =>
+  /^(non|no|nope|modifier|changer|corriger)\b/.test(strip(t));
 
 function nextQuestion(d: Draft): { field: NonNullable<Draft['asked']>; text: string } | null {
   const goods = d.cargoType ? possessive(d.cargoType) : 'votre marchandise';
   const pron = d.cargoType && /[sx]$/i.test(d.cargoType) ? 'les ' : 'l’';
   const unit = d.unit ?? 'unité';
-  if (!d.cargoType) return { field: 'cargoType', text: 'D’accord ! Quelle marchandise souhaitez-vous envoyer ?' };
-  if (!d.destination) return { field: 'destination', text: `D’accord pour ${goods} ! Vers quelle destination souhaitez-vous ${pron}envoyer ?` };
-  if (!d.departure) return { field: 'departure', text: `D’accord ! Depuis quel port souhaitez-vous envoyer ${goods} ?` };
-  if (!d.quantity) return { field: 'quantity', text: 'Très bien. Quelle quantité souhaitez-vous envoyer ?' };
+
+  if (!d.cargoType) {
+    return { field: 'cargoType', text: 'D’accord ! Quelle marchandise souhaitez-vous envoyer ?' };
+  }
+  if (!d.destination) {
+    return {
+      field: 'destination',
+      text: `D’accord pour ${goods} ! Vers quelle destination souhaitez-vous ${pron}envoyer ?`,
+    };
+  }
+  if (!d.departure) {
+    return {
+      field: 'departure',
+      text: `D’accord ! Depuis quel port souhaitez-vous envoyer ${goods} ?`,
+    };
+  }
+  if (!d.quantity) {
+    return { field: 'quantity', text: 'Très bien. Quelle quantité souhaitez-vous envoyer ?' };
+  }
   if (d.weightKg === undefined) {
     return {
       field: 'weight',
-      text: d.quantity > 1
-        ? `Compris pour ${say(d.quantity)} ${pluralize(unit, d.quantity)}. Connaissez-vous le poids de chaque ${unit} ou le poids total ?`
-        : 'Quel est le poids de votre envoi (en kg) ?',
+      text:
+        d.quantity > 1
+          ? `Compris pour ${say(d.quantity)} ${pluralize(unit, d.quantity)}. Connaissez-vous le poids de chaque ${unit} ou le poids total ?`
+          : 'Quel est le poids de votre envoi (en kg) ?',
     };
   }
   if (d.quantity > 1 && !d.weightMode) {
@@ -303,33 +380,181 @@ function nextQuestion(d: Draft): { field: NonNullable<Draft['asked']>; text: str
     };
   }
   if (!d.dateExact) {
-    const each = d.quantity > 1 ? Math.round(((d.totalWeightKg ?? 0) / d.quantity) * 100) / 100 : d.totalWeightKg;
-    const ack = d.quantity > 1
-      ? `Compris, ${say(d.quantity)} ${pluralize(unit, d.quantity)} de ${each} kg, soit ${d.totalWeightKg} kg au total.`
-      : `Compris, ${d.totalWeightKg} kg.`;
-    return { field: 'date', text: `${ack} Pour quelle date souhaitez-vous organiser le transport ?` };
+    const each =
+      d.quantity > 1
+        ? Math.round(((d.totalWeightKg ?? 0) / d.quantity) * 100) / 100
+        : d.totalWeightKg;
+    const ack =
+      d.quantity > 1
+        ? `Compris, ${say(d.quantity)} ${pluralize(unit, d.quantity)} de ${each} kg, soit ${d.totalWeightKg} kg au total.`
+        : `Compris, ${d.totalWeightKg} kg.`;
+    return {
+      field: 'date',
+      text: `${ack} Pour quelle date souhaitez-vous organiser le transport ?`,
+    };
   }
   return null;
 }
 
 function computeTotals(d: Draft) {
   if (d.weightKg === undefined) return;
-  if (!d.quantity || d.quantity === 1) { d.totalWeightKg = d.weightKg; d.unitWeightKg = d.weightKg; }
-  else if (d.weightMode === 'unit') { d.unitWeightKg = d.weightKg; d.totalWeightKg = d.weightKg * d.quantity; }
-  else if (d.weightMode === 'total') { d.totalWeightKg = d.weightKg; d.unitWeightKg = Math.round((d.weightKg / d.quantity) * 100) / 100; }
-  else { d.totalWeightKg = undefined; d.unitWeightKg = undefined; }
+  if (!d.quantity || d.quantity === 1) {
+    d.totalWeightKg = d.weightKg;
+    d.unitWeightKg = d.weightKg;
+  } else if (d.weightMode === 'unit') {
+    d.unitWeightKg = d.weightKg;
+    d.totalWeightKg = d.weightKg * d.quantity;
+  } else if (d.weightMode === 'total') {
+    d.totalWeightKg = d.weightKg;
+    d.unitWeightKg = Math.round((d.weightKg / d.quantity) * 100) / 100;
+  } else {
+    d.totalWeightKg = undefined;
+    d.unitWeightKg = undefined;
+  }
 }
 
+/* =========================================================
+   LLM Provider (Ollama local / Groq ou OpenAI en prod)
+========================================================= */
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
+interface LLMProvider {
+  chat(messages: ChatMessage[], options?: { temperature?: number; maxTokens?: number }): Promise<string>;
+}
+
+class OllamaProvider implements LLMProvider {
+  constructor(private model = process.env.OLLAMA_MODEL || 'llama3.2') {}
+
+  async chat(messages: ChatMessage[], options = {}) {
+    const res = await fetch('http://localhost:11434/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: this.model,
+        messages,
+        stream: false,
+        options: {
+          temperature: options.temperature ?? 0.05,
+          num_predict: options.maxTokens ?? 512,
+        },
+      }),
+    });
+    if (!res.ok) throw new Error(`Ollama ${res.status}`);
+    const data = await res.json();
+    return data.message?.content ?? '';
+  }
+}
+
+class GroqProvider implements LLMProvider {
+  constructor(private apiKey = process.env.GROQ_API_KEY!) {}
+
+  async chat(messages: ChatMessage[], options = {}) {
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.GROQ_MODEL || 'llama-3.1-8b-instant',
+        messages,
+        temperature: options.temperature ?? 0.05,
+        max_tokens: options.maxTokens ?? 512,
+        response_format: { type: 'json_object' },
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`Groq ${res.status}: ${err}`);
+    }
+    const data = await res.json();
+    return data.choices[0]?.message?.content ?? '';
+  }
+}
+
+class OpenAIProvider implements LLMProvider {
+  constructor(private apiKey = process.env.OPENAI_API_KEY!) {}
+
+  async chat(messages: ChatMessage[], options = {}) {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
+        messages,
+        temperature: options.temperature ?? 0.05,
+        max_tokens: options.maxTokens ?? 512,
+        response_format: { type: 'json_object' },
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error(`OpenAI ${res.status}: ${err}`);
+    }
+    const data = await res.json();
+    return data.choices[0]?.message?.content ?? '';
+  }
+}
+
+function createLLMProvider(): LLMProvider {
+  const provider = process.env.AI_PROVIDER?.toLowerCase();
+  const env = process.env.NODE_ENV || 'development';
+
+  if (provider === 'ollama' || (env === 'development' && !provider)) {
+    return new OllamaProvider();
+  }
+  if (provider === 'openai') {
+    return new OpenAIProvider();
+  }
+  return new GroqProvider(); // défaut production
+}
+
+const SYSTEM_PROMPT = `Tu es l'assistant de réservation de Saint-Jude (transport maritime Madagascar).
+Tu extrais UNIQUEMENT les informations fournies par le client. Tu n'inventes JAMAIS de prix, de disponibilité ou de date.
+
+Réponds UNIQUEMENT en JSON strict :
+{
+  "cargoType": string | null,
+  "unit": string | null,
+  "quantity": number | null,
+  "weightKg": number | null,
+  "weightMode": "unit" | "total" | null,
+  "departure": string | null,
+  "destination": string | null,
+  "dateText": string | null,
+  "confidence": number
+}
+
+Règles strictes :
+- Ne jamais inventer une valeur absente.
+- Si le client dit seulement un nom de port, place-le selon le contexte (departure ou destination).
+- Les ports connus sont fournis dynamiquement.
+- dateText = texte brut dit par le client ("demain", "vendredi prochain", "15 octobre"...).
+`;
+
+/* =========================================================
+   Route /chat (hybride LLM + déterministe)
+========================================================= */
 aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => {
   try {
     const question = String(req.body?.question ?? '').trim();
-    if (!question) return res.status(400).json({ error: 'Question requise' });
+    if (!question) {
+      return res.status(400).json({ error: 'Question requise' });
+    }
 
     let parsedContext: Record<string, any> = {};
     try {
       const raw = req.body?.context;
       if (raw) parsedContext = typeof raw === 'string' ? JSON.parse(raw) : raw;
-    } catch { /* contexte illisible : on repart d'un brouillon vide */ }
+    } catch {
+      /* contexte illisible → brouillon vide */
+    }
 
     const draft: Draft = { ...(parsedContext.currentContext ?? {}) };
     const text = question.toLowerCase();
@@ -337,15 +562,21 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     let reply = '';
     let quoteSummary: Record<string, unknown> | null = null;
 
-    // ---- Récapitulatif présenté : seul « oui » confirme (jamais un « oui » au milieu d'une phrase)
+    // ---- Confirmation oui/non
     if (draft.awaitingConfirm && isYes(question)) {
       const total = draft.totalWeightKg;
       if (!draft.tripId || !draft.departure || !draft.destination || !draft.dateExact || !total) {
         draft.awaitingConfirm = false;
-        reply = 'Il manque des informations pour la réservation. Reprenons : ' + (nextQuestion(draft)?.text ?? 'pouvez-vous reformuler ?');
+        reply =
+          'Il manque des informations pour la réservation. Reprenons : ' +
+          (nextQuestion(draft)?.text ?? 'pouvez-vous reformuler ?');
       } else {
-        // Revérification juste avant l'enregistrement (la capacité a pu changer)
-        const check = await verifyTrip({ depart: draft.departure, arrivee: draft.destination, date: draft.dateExact, poidsTotalKg: total });
+        const check = await verifyTrip({
+          depart: draft.departure,
+          arrivee: draft.destination,
+          date: draft.dateExact,
+          poidsTotalKg: total,
+        });
         if (!check.available) {
           draft.awaitingConfirm = false;
           reply = check.message ?? 'Ce trajet n’est plus disponible.';
@@ -364,89 +595,166 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       }
       return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
     }
-    if (draft.awaitingConfirm && isNo(question)) draft.awaitingConfirm = false; // correction : on fusionne ci-dessous
+    if (draft.awaitingConfirm && isNo(question)) {
+      draft.awaitingConfirm = false;
+    }
 
-    // ---- Date relative ambiguë en attente (« Parlez-vous de vendredi 16 octobre ? »)
+    // ---- Confirmation date ambiguë
     if (draft.dateToConfirm) {
       if (isYes(question)) {
         draft.dateToConfirm = false;
-        // la date reste celle proposée
       } else if (isNo(question) && !parseRelativeDate(question)) {
         draft.dateToConfirm = false;
-        delete draft.dateExact; delete draft.dateFormatted;
+        delete draft.dateExact;
+        delete draft.dateFormatted;
       } else {
-        draft.dateToConfirm = false; // nouvelle date donnée : traitée plus bas
+        draft.dateToConfirm = false;
       }
     }
 
-    // ---- 1. Extraction : tout ce que le client donne, dans le désordre
+    // ---- 1. Extraction (LLM d’abord, fallback déterministe)
     const before = { ...draft };
-    const goods = extractGoods(text, places);
-    if (goods.cargoType) draft.cargoType = goods.cargoType;
-    else if (draft.asked === 'cargoType' && !draft.cargoType) {
-      const bare = text.replace(/[.!?,;]+$/g, '').replace(/^(?:du|de la|de l['’]|des|de|d['’]|un|une|le|la|les)\s*/, '').trim();
-      if (bare && bare.split(' ').length <= 3 && !/\d/.test(bare) && !isYes(bare) && !isNo(bare)) draft.cargoType = bare;
-    }
-    if (goods.unit) draft.unit = goods.unit;
-    if (goods.quantity) draft.quantity = goods.quantity;
 
-    const route = extractRoute(text, places, draft, draft.asked === 'departure' ? 'departure' : draft.asked === 'destination' ? 'destination' : undefined);
-    if (route.departure) draft.departure = route.departure;
-    if (route.destination) draft.destination = route.destination;
+    let llmOk = false;
+    try {
+      const llm = createLLMProvider();
+      const messages: ChatMessage[] = [
+        {
+          role: 'system',
+          content: SYSTEM_PROMPT + `\nPorts connus : ${places.join(', ')}`,
+        },
+        { role: 'user', content: question },
+      ];
+      const raw = await llm.chat(messages, { temperature: 0.05 });
+      const extracted = JSON.parse(raw);
 
-    const t = digitize(text);
-    const w = t.match(/(\d+(?:[.,]\d+)?)\s*(kg|kilos?|tonnes?)/i);
-    if (w) {
-      const v = parseFloat(w[1].replace(',', '.')) * (/^t/i.test(w[2]) ? 1000 : 1);
-      draft.weightKg = v;
-      draft.weightMode = undefined;
-    }
-    if (/\bchacun|\bchacune|\bchaque\b|\bpar\s+\p{L}+/iu.test(t) && (w || draft.asked === 'weightMode')) draft.weightMode = 'unit';
-    else if (/\btotal\b|au total|en tout/i.test(t) && (w || draft.asked === 'weightMode')) draft.weightMode = 'total';
+      if (extracted.cargoType) draft.cargoType = extracted.cargoType;
+      if (extracted.unit) draft.unit = singular(extracted.unit);
+      if (typeof extracted.quantity === 'number') draft.quantity = extracted.quantity;
+      if (typeof extracted.weightKg === 'number') {
+        draft.weightKg = extracted.weightKg;
+        draft.weightMode = undefined;
+      }
+      if (extracted.weightMode === 'unit' || extracted.weightMode === 'total') {
+        draft.weightMode = extracted.weightMode;
+      }
+      if (extracted.departure) draft.departure = extracted.departure;
+      if (extracted.destination) draft.destination = extracted.destination;
 
-    // Réponse courte à la dernière question posée (« 3 », « trois », « 20 »)
-    const lone = strip(text).replace(/[.!?]+$/, '');
-    const loneNum = /^\d{1,5}$/.test(lone) ? +lone : (NUM_WORDS[lone] as number | undefined);
-    if (loneNum !== undefined && !w) {
-      if (draft.asked === 'quantity') draft.quantity = loneNum;
-      else if (draft.asked === 'weight') { draft.weightKg = loneNum; draft.weightMode = undefined; }
+      if (extracted.dateText) {
+        const dateParsed = parseRelativeDate(extracted.dateText);
+        if (dateParsed) {
+          if (dateParsed.dateStr < todayLocal()) {
+            delete draft.dateExact;
+            delete draft.dateFormatted;
+            draft.asked = 'date';
+            reply = 'La date indiquée est déjà passée. Pour quelle date souhaitez-vous organiser le transport ?';
+            return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+          }
+          draft.dateExact = dateParsed.dateStr;
+          draft.dateFormatted = dateParsed.formatted;
+          if (dateParsed.ambiguous) {
+            draft.dateToConfirm = true;
+            draft.asked = 'date';
+            reply = `Aujourd’hui, c’est déjà ${DAY_NAMES[new Date(`${todayLocal()}T12:00:00Z`).getUTCDay()]}. Parlez-vous de ${dateParsed.formatted} ?`;
+            return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+          }
+        }
+      }
+      llmOk = true;
+    } catch (err) {
+      console.warn('LLM indisponible → fallback déterministe', err);
     }
-    // « Mahajanga » seul, sans préposition
-    if (!route.departure && !route.destination && draft.asked && /^(departure|destination)$/.test(draft.asked)) {
-      const only = found1(places, lone);
-      if (only) (draft.asked === 'departure' ? (draft.departure = only) : (draft.destination = only));
+
+    // Fallback déterministe si LLM a échoué ou a peu extrait
+    if (!llmOk) {
+      const goods = extractGoods(text, places);
+      if (goods.cargoType) draft.cargoType = goods.cargoType;
+      else if (draft.asked === 'cargoType' && !draft.cargoType) {
+        const bare = text
+          .replace(/[.!?,;]+$/g, '')
+          .replace(/^(?:du|de la|de l['’]|des|de|d['’]|un|une|le|la|les)\s*/, '')
+          .trim();
+        if (bare && bare.split(' ').length <= 3 && !/\d/.test(bare) && !isYes(bare) && !isNo(bare)) {
+          draft.cargoType = bare;
+        }
+      }
+      if (goods.unit) draft.unit = goods.unit;
+      if (goods.quantity) draft.quantity = goods.quantity;
+
+      const route = extractRoute(
+        text,
+        places,
+        draft,
+        draft.asked === 'departure' ? 'departure' : draft.asked === 'destination' ? 'destination' : undefined,
+      );
+      if (route.departure) draft.departure = route.departure;
+      if (route.destination) draft.destination = route.destination;
+
+      const t = digitize(text);
+      const w = t.match(/(\d+(?:[.,]\d+)?)\s*(kg|kilos?|tonnes?)/i);
+      if (w) {
+        const v = parseFloat(w[1].replace(',', '.')) * (/^t/i.test(w[2]) ? 1000 : 1);
+        draft.weightKg = v;
+        draft.weightMode = undefined;
+      }
+      if (/\bchacun|\bchacune|\bchaque\b|\bpar\s+\p{L}+/iu.test(t) && (w || draft.asked === 'weightMode')) {
+        draft.weightMode = 'unit';
+      } else if (/\btotal\b|au total|en tout/i.test(t) && (w || draft.asked === 'weightMode')) {
+        draft.weightMode = 'total';
+      }
+
+      const lone = strip(text).replace(/[.!?]+$/, '');
+      const loneNum = /^\d{1,5}$/.test(lone) ? +lone : (NUM_WORDS[lone] as number | undefined);
+      if (loneNum !== undefined && !w) {
+        if (draft.asked === 'quantity') draft.quantity = loneNum;
+        else if (draft.asked === 'weight') {
+          draft.weightKg = loneNum;
+          draft.weightMode = undefined;
+        }
+      }
+      if (!route.departure && !route.destination && draft.asked && /^(departure|destination)$/.test(draft.asked)) {
+        const only = found1(places, lone);
+        if (only) {
+          if (draft.asked === 'departure') draft.departure = only;
+          else draft.destination = only;
+        }
+      }
+
+      const dateParsed = parseRelativeDate(text);
+      if (dateParsed) {
+        if (dateParsed.dateStr < todayLocal()) {
+          delete draft.dateExact;
+          delete draft.dateFormatted;
+          draft.asked = 'date';
+          reply = 'La date indiquée est déjà passée. Pour quelle date souhaitez-vous organiser le transport ?';
+          return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+        }
+        draft.dateExact = dateParsed.dateStr;
+        draft.dateFormatted = dateParsed.formatted;
+        if (dateParsed.ambiguous) {
+          draft.dateToConfirm = true;
+          draft.asked = 'date';
+          reply = `Aujourd’hui, c’est déjà ${DAY_NAMES[new Date(`${todayLocal()}T12:00:00Z`).getUTCDay()]}. Parlez-vous de ${dateParsed.formatted} ?`;
+          return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+        }
+      }
     }
+
     computeTotals(draft);
 
-    // Date (convertie selon la date locale de Madagascar)
-    const dateParsed = parseRelativeDate(text);
-    if (dateParsed) {
-      if (dateParsed.dateStr < todayLocal()) {
-        delete draft.dateExact; delete draft.dateFormatted;
-        draft.asked = 'date';
-        reply = 'La date indiquée est déjà passée. Pour quelle date souhaitez-vous organiser le transport ?';
-        return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
-      }
-      draft.dateExact = dateParsed.dateStr;
-      draft.dateFormatted = dateParsed.formatted;
-      if (dateParsed.ambiguous) {
-        draft.dateToConfirm = true;
-        draft.asked = 'date';
-        reply = `Aujourd’hui, c’est déjà ${DAY_NAMES[new Date(`${todayLocal()}T12:00:00Z`).getUTCDay()]}. Parlez-vous de ${dateParsed.formatted} ?`;
-        return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
-      }
-    }
-
-    // Corrections signalées sans recommencer
+    // Corrections signalées
     const changed: string[] = [];
     if (before.departure && draft.departure !== before.departure) changed.push(`départ : ${draft.departure}`);
     if (before.destination && draft.destination !== before.destination) changed.push(`destination : ${draft.destination}`);
-    if (before.dateExact && draft.dateExact !== before.dateExact && draft.dateFormatted) changed.push(`date : ${draft.dateFormatted}`);
+    if (before.dateExact && draft.dateExact !== before.dateExact && draft.dateFormatted) {
+      changed.push(`date : ${draft.dateFormatted}`);
+    }
     if (before.cargoType && draft.cargoType !== before.cargoType) changed.push(`marchandise : ${draft.cargoType}`);
     if (before.quantity && draft.quantity !== before.quantity) changed.push(`quantité : ${draft.quantity}`);
     const prefix = changed.length ? `C’est corrigé (${changed.join(', ')}). ` : '';
 
-    // ---- 2. Une seule question ciblée à la fois
+    // ---- 2. Une seule question ciblée
     const q = nextQuestion(draft);
     if (q) {
       draft.asked = q.field;
@@ -455,7 +763,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
     }
 
-    // ---- 3. Tout est connu : le backend vérifie trajet, capacité et tarif AVANT d'annoncer un résultat
+    // ---- 3. Tout est connu → vérification SQL obligatoire
     draft.asked = undefined;
     const result = await verifyTrip({
       depart: draft.departure!,
@@ -496,10 +804,5 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     return res.status(500).json({ error: 'Erreur lors du traitement de la demande' });
   }
 });
-
-// Réponse « Mahajanga » seule : retrouve le port connu correspondant
-function found1(places: string[], loneNorm: string): string | undefined {
-  return places.find((p) => strip(p).replace(/’/g, "'") === loneNorm.replace(/’/g, "'"));
-}
 
 export default aiRouter;
