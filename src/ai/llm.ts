@@ -174,4 +174,7 @@ async function chatOpenAICompat(
     content: msg?.content ?? '',
     ...(toolCalls?.length ? { tool_calls: toolCalls } : {}),
   };
+
+
+  
 }
