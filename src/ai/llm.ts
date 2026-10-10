@@ -66,7 +66,6 @@ async function chatOllama(messages: Msg[], tools?: unknown[]): Promise<Msg> {
   });
 
   if (!res.ok) {
-    // Le corps d'erreur d'Ollama dit par exemple « model 'xxx' not found »
     const detail = await res.text().catch(() => '');
     throw new Error(`Ollama a répondu ${res.status} (modèle ${model}) : ${detail.slice(0, 300)}`);
   }
@@ -174,7 +173,4 @@ async function chatOpenAICompat(
     content: msg?.content ?? '',
     ...(toolCalls?.length ? { tool_calls: toolCalls } : {}),
   };
-
-
-  
 }
