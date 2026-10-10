@@ -6,6 +6,7 @@ import { createServer } from 'http';
 
 import { createCrudRouter } from './utils/crudRouter.js';
 import { aiRouter } from './routes/ai.js';
+import { analyticsRouter } from './routes/analytics.js';
 import aiCapabilitiesRouter from './routes/ai-capabilities.js';
 import reservationAiRouter from './routes/reservations-ai.js';
 import reservationStatusRouter from './routes/reservationStatus.js';
@@ -166,6 +167,7 @@ app.use(
 ========================= */
 
 app.use('/api/ai', requireAuth, aiRouter);
+app.use('/api/analytics', requireAuth, analyticsRouter);
 
 app.use('/api/ai-capabilities', requireAuth, aiCapabilitiesRouter);
 
