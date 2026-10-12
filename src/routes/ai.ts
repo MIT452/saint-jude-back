@@ -4,8 +4,14 @@ import { pool } from '../db.js';
 
 export const aiRouter = Router();
 
+// Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
+type Db = { query: (text: string, values?: any[]) => Promise<{ rows: any[] }> };
+const defaultDb = pool as unknown as Db;
+
 /* =========================================================
    Rate limiter : 10 requêtes / minute par IP
+   (derrière Render, ajouter app.set('trust proxy', 1) dans server.ts,
+    sinon tous les utilisateurs partagent la même IP et la même limite)
 ========================================================= */
 const hits = new Map<string, number[]>();
 export function aiRequestLimiter(req: Request, res: Response, next: NextFunction) {
@@ -30,6 +36,10 @@ export function aiRequestLimiter(req: Request, res: Response, next: NextFunction
 ========================================================= */
 const TZ = 'Indian/Antananarivo';
 const DAY_NAMES = ['dimanche', 'lundi', 'mardi', 'mercredi', 'jeudi', 'vendredi', 'samedi'];
+const MONTH_NAMES = [
+  'janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin',
+  'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre',
+];
 
 const strip = (s: string) =>
   s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
@@ -52,6 +62,21 @@ const formatFr = (isoDate: string) =>
     timeZone: 'UTC',
   });
 
+const formatFrShort = (isoDate: string) =>
+  new Date(`${isoDate}T12:00:00Z`).toLocaleDateString('fr-FR', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'long',
+    timeZone: 'UTC',
+  });
+
+/** Construit YYYY-MM-DD en refusant les dates impossibles (31 février...). */
+function buildIso(y: number, m: number, d: number): string | null {
+  const dt = new Date(Date.UTC(y, m - 1, d, 12));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== m - 1 || dt.getUTCDate() !== d) return null;
+  return dt.toISOString().slice(0, 10);
+}
+
 /** null si aucune date ; ambiguous = « vendredi » dit un vendredi. */
 export function parseRelativeDate(
   text: string,
@@ -61,12 +86,48 @@ export function parseRelativeDate(
   let target: string | null = null;
   let ambiguous = false;
 
-  const isoMatch = t.match(/\b\d{4}-\d{2}-\d{2}\b/);
-  if (isoMatch) target = isoMatch[0];
-  else if (/apres[- ]demain/.test(t)) target = addDays(today, 2);
-  else if (/\bdemain\b/.test(t)) target = addDays(today, 1);
-  else if (/aujourd/.test(t)) target = today;
-  else {
+  // Jour/mois (+ année facultative) → date ; sans année, on prend la prochaine occurrence
+  const fromParts = (day: number, month: number, yearStr?: string) => {
+    if (yearStr) {
+      const y = yearStr.length === 2 ? 2000 + Number(yearStr) : Number(yearStr);
+      return buildIso(y, month, day);
+    }
+    const y = Number(today.slice(0, 4));
+    const candidate = buildIso(y, month, day);
+    return candidate && candidate < today ? buildIso(y + 1, month, day) : candidate;
+  };
+
+  const isoMatch = t.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (isoMatch) target = buildIso(+isoMatch[1], +isoMatch[2], +isoMatch[3]);
+
+  if (!target) {
+    if (/apres[- ]demain/.test(t)) target = addDays(today, 2);
+    else if (/\bdemain\b/.test(t)) target = addDays(today, 1);
+    else if (/aujourd/.test(t)) target = today;
+  }
+
+  if (!target) {
+    const inDays = t.match(/\bdans\s+(\d{1,2})\s+jours?\b/);
+    if (inDays) target = addDays(today, +inDays[1]);
+  }
+
+  // « 15 octobre », « 12 octobre 2026 »
+  if (!target) {
+    const textual = t.match(
+      new RegExp(`\\b(\\d{1,2})(?:er)?\\s+(${MONTH_NAMES.join('|')})(?:\\s+(\\d{4}))?\\b`),
+    );
+    if (textual) target = fromParts(+textual[1], MONTH_NAMES.indexOf(textual[2]) + 1, textual[3]);
+  }
+
+  // « 12/10/2026 », « 12-10 » (jamais « 10.5 kg » : le point n'est accepté qu'avec l'année)
+  if (!target) {
+    const numeric =
+      t.match(/\b(\d{1,2})[\/-](\d{1,2})(?:[\/-](\d{2,4}))?\b(?!\s*(?:kg|kilos?|tonnes?))/) ??
+      t.match(/\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b/);
+    if (numeric) target = fromParts(+numeric[1], +numeric[2], numeric[3]);
+  }
+
+  if (!target) {
     const m = t.match(new RegExp(`\\b(${DAY_NAMES.join('|')})\\b(\\s+prochain)?`));
     if (m) {
       const todayIdx = new Date(`${today}T12:00:00Z`).getUTCDay();
@@ -78,6 +139,7 @@ export function parseRelativeDate(
       target = addDays(today, diff);
     }
   }
+
   return target ? { dateStr: target, formatted: formatFr(target), ambiguous } : null;
 }
 
@@ -90,6 +152,7 @@ export interface VerifyInput {
   date: string; // YYYY-MM-DD
   poidsTotalKg?: number;
   passagers?: number;
+  tripId?: string; // restreint la vérification à un voyage précis (après verrouillage)
 }
 
 export interface VerifyResult {
@@ -100,28 +163,37 @@ export interface VerifyResult {
   message?: string;
 }
 
-const TRIP_FILTER = `LOWER(t."from") LIKE $1 AND LOWER(t."to") LIKE $2`;
+// % et _ saisis par l'utilisateur sont échappés : ce ne sont pas des jokers
+const likeParam = (s: string) => `%${s.trim().toLowerCase().replace(/[\\%_]/g, '\\$&')}%`;
 
-export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
-  const params = [`%${i.depart.toLowerCase()}%`, `%${i.arrivee.toLowerCase()}%`, i.date];
+const TRIP_FILTER = `LOWER(t."from") LIKE $1 ESCAPE '\\' AND LOWER(t."to") LIKE $2 ESCAPE '\\'`;
 
-  // Les réservations annulées ou refusées ne consomment pas de capacité
-  const { rows } = await pool.query(
-    `SELECT t.id, t.price_per_kg, b.name AS boat_name, b.capacity,
-            COALESCE((SELECT SUM(r.weight) FROM reservations r
-                      WHERE r."tripId" = t.id
-                        AND UPPER(r.status) NOT LIKE 'ANNUL%'
-                        AND UPPER(r.status) NOT LIKE 'CANCEL%'
-                        AND UPPER(r.status) NOT LIKE 'REFUS%'), 0) AS used
+// Les réservations annulées ou refusées ne consomment pas de capacité
+const USED_SQL = `COALESCE((SELECT SUM(r.weight) FROM reservations r
+                    WHERE r."tripId" = t.id
+                      AND UPPER(r.status) NOT LIKE 'ANNUL%'
+                      AND UPPER(r.status) NOT LIKE 'CANCEL%'
+                      AND UPPER(r.status) NOT LIKE 'REFUS%'), 0)`;
+
+export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<VerifyResult> {
+  if (i.date < todayLocal()) {
+    return { available: false, message: 'La date demandée est déjà passée.' };
+  }
+
+  const params = [likeParam(i.depart), likeParam(i.arrivee), i.date];
+
+  const { rows: allRows } = await db.query(
+    `SELECT t.id, t.price_per_kg, b.name AS boat_name, b.capacity, ${USED_SQL} AS used
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
      ORDER BY t.depart ASC`,
     params,
   );
+  const rows = i.tripId ? allRows.filter((r) => String(r.id) === String(i.tripId)) : allRows;
 
   if (rows.length === 0) {
-    const next = await pool.query(
+    const next = await db.query(
       `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day
        FROM trips t
        WHERE ${TRIP_FILTER} AND t.depart::date > $3::date
@@ -161,13 +233,41 @@ export async function verifyTrip(i: VerifyInput): Promise<VerifyResult> {
   };
 }
 
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const isRealIsoDate = (s: string) =>
+  ISO_DATE.test(s) && buildIso(+s.slice(0, 4), +s.slice(5, 7), +s.slice(8, 10)) === s;
+
+function readVerifyBody(body: any): { value: VerifyInput } | { error: string } {
+  const depart = typeof body?.depart === 'string' ? body.depart.trim() : '';
+  const arrivee = typeof body?.arrivee === 'string' ? body.arrivee.trim() : '';
+  const date = typeof body?.date === 'string' ? body.date.trim() : '';
+  if (depart.length < 2 || depart.length > 80 || arrivee.length < 2 || arrivee.length > 80) {
+    return { error: 'depart et arrivee requis (2 à 80 caractères)' };
+  }
+  if (!isRealIsoDate(date)) return { error: 'date requise au format AAAA-MM-JJ' };
+
+  let poidsTotalKg: number | undefined;
+  if (body?.poidsTotalKg !== undefined && body?.poidsTotalKg !== null) {
+    poidsTotalKg = Number(body.poidsTotalKg);
+    if (!Number.isFinite(poidsTotalKg) || poidsTotalKg <= 0 || poidsTotalKg > 1_000_000) {
+      return { error: 'poidsTotalKg invalide' };
+    }
+  }
+  let passagers: number | undefined;
+  if (body?.passagers !== undefined && body?.passagers !== null) {
+    passagers = Number(body.passagers);
+    if (!Number.isInteger(passagers) || passagers < 1 || passagers > 1000) {
+      return { error: 'passagers invalide' };
+    }
+  }
+  return { value: { depart, arrivee, date, poidsTotalKg, passagers } };
+}
+
 aiRouter.post('/verify', aiRequestLimiter, async (req: Request, res: Response) => {
   try {
-    const { depart, arrivee, date, poidsTotalKg, passagers } = req.body ?? {};
-    if (!depart || !arrivee || !date) {
-      return res.status(400).json({ error: 'depart, arrivee et date requis' });
-    }
-    return res.json(await verifyTrip({ depart, arrivee, date, poidsTotalKg, passagers }));
+    const parsed = readVerifyBody(req.body);
+    if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+    return res.json(await verifyTrip(parsed.value));
   } catch (error) {
     console.error('Erreur /verify:', error);
     return res.status(500).json({ error: 'Erreur lors de la vérification' });
@@ -175,7 +275,9 @@ aiRouter.post('/verify', aiRequestLimiter, async (req: Request, res: Response) =
 });
 
 /* =========================================================
-   Draft & extraction déterministe (fallback)
+   Draft : le contexte vient du navigateur, donc on ne lui fait pas confiance.
+   On ne garde que des valeurs simples et validées ; tripId, prix et totaux
+   sont toujours recalculés par le serveur.
 ========================================================= */
 interface Draft {
   cargoType?: string;
@@ -198,13 +300,54 @@ interface Draft {
   confirmedByUser?: boolean;
 }
 
+const ASKED_VALUES = ['cargoType', 'destination', 'departure', 'quantity', 'weight', 'weightMode', 'date'];
+
+const cleanStr = (v: unknown, max = 80) =>
+  typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
+
+const cleanNum = (v: unknown, max = 1_000_000) => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+  return Number.isFinite(n) && n > 0 && n <= max ? n : undefined;
+};
+
+function sanitizeDraft(raw: unknown): Draft {
+  const r = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const d: Draft = {};
+
+  d.cargoType = cleanStr(r.cargoType, 60);
+  d.unit = cleanStr(r.unit, 20);
+  const qty = cleanNum(r.quantity, 100_000);
+  if (qty !== undefined && Number.isInteger(qty)) d.quantity = qty;
+  d.weightKg = cleanNum(r.weightKg);
+  if (r.weightMode === 'unit' || r.weightMode === 'total') d.weightMode = r.weightMode;
+  d.departure = cleanStr(r.departure);
+  d.destination = cleanStr(r.destination);
+
+  const date = cleanStr(r.dateExact, 10);
+  if (date && isRealIsoDate(date)) {
+    d.dateExact = date;
+    d.dateFormatted = formatFr(date);
+  }
+  if (typeof r.asked === 'string' && ASKED_VALUES.includes(r.asked)) d.asked = r.asked as Draft['asked'];
+  d.awaitingConfirm = r.awaitingConfirm === true;
+  d.dateToConfirm = r.dateToConfirm === true;
+  return d;
+}
+
+const hasDraftContent = (d: Draft) =>
+  !!(d.cargoType || d.departure || d.destination || d.quantity || d.weightKg || d.dateExact);
+
+// Signature des données utiles : sert à savoir si le message a apporté une information
+const dataSig = (d: Draft) =>
+  JSON.stringify([d.cargoType, d.unit, d.quantity, d.weightKg, d.weightMode, d.departure, d.destination, d.dateExact]);
+
 let placesCache = { at: 0, list: [] as string[] };
 
 async function getKnownPlaces(): Promise<string[]> {
   if (placesCache.list.length && Date.now() - placesCache.at < 60_000) {
     return placesCache.list;
   }
-  const { rows } = await pool.query(
+  const { rows } = await defaultDb.query(
     `SELECT DISTINCT "from" AS name FROM trips
      UNION
      SELECT DISTINCT "to" AS name FROM trips`,
@@ -217,6 +360,9 @@ async function getKnownPlaces(): Promise<string[]> {
   return list;
 }
 
+/* =========================================================
+   Extraction déterministe (fallback et compléments)
+========================================================= */
 const NUM_WORDS: Record<string, number> = {
   un: 1, une: 1, deux: 2, trois: 3, quatre: 4, cinq: 5,
   six: 6, sept: 7, huit: 8, neuf: 9, dix: 10,
@@ -342,6 +488,10 @@ const isYes = (t: string) =>
   /^(oui|ok|d'accord|confirme|confirmer|valide|valider)\b/.test(strip(t));
 const isNo = (t: string) =>
   /^(non|no|nope|modifier|changer|corriger)\b/.test(strip(t));
+const isCancelIntent = (t: string) =>
+  /^(annule|annuler|stop|laisse tomber|abandonne|abandonner|abandon)\b/.test(strip(t));
+const isRestartIntent = (t: string) =>
+  /^(recommence|recommencer|reset|nouvelle demande|autre demande)\b/.test(strip(t));
 
 /** Salutation seule (« bonjour », « bonjours », « salut ! »…) : ce n'est PAS une réponse à la question. */
 const isPureGreeting = (t: string) =>
@@ -354,6 +504,19 @@ const isSmallTalk = (t: string) =>
   /^(tu vas bien|vous allez bien|ca va|ca va bien|comment (ca va|vas[- ]tu|tu vas|allez[- ]vous|vous allez)|merci|merci beaucoup|ok merci|super|cool)[\s!?.,;]*$/.test(
     strip(t),
   );
+
+const looksLikeQuestion = (t: string) =>
+  /\?\s*$/.test(t) ||
+  /^(combien|quel|quels|quelle|quelles|y a[- ]t[- ]il|est[- ]ce|ou |quand|comment|pourquoi|a quelle|c'est quoi|qu'est|peux[- ]tu|pouvez[- ]vous|donne|liste|affiche|montre|dis[- ]moi|et le|et la|et les)/.test(
+    strip(t).replace(/’/g, "'"),
+  );
+
+// Une demande de réservation contient ces mots : ce n'est pas une simple question d'information
+const RESERVATION_WORDS =
+  /\b(reserver|envoyer|expedier|transporter|acheminer|colis|sacs?|cartons?|caisses?|kg|kilos?|tonnes?|passagers?)\b/;
+const BOAT_WORDS = /\b(bateau|bateaux|navire|navires)\b/;
+const TRIP_WORDS =
+  /\b(voyage|voyages|trajet|trajets|depart|departs|horaire|horaires|prochain|prochains|tarif|tarifs|prix|cout|coute)\b/;
 
 /** Mots d'une conversation, jamais d'une marchandise. */
 const CHAT_WORDS = new Set([
@@ -403,7 +566,6 @@ const parseJsonLoose = (raw: string): Record<string, any> => {
 
 function nextQuestion(d: Draft): { field: NonNullable<Draft['asked']>; text: string } | null {
   const goods = d.cargoType ? possessive(d.cargoType) : 'votre marchandise';
-  // CORRIGÉ : l'espace était perdu → « lesenvoyer »
   const sendIt = d.cargoType && /[sx]$/i.test(d.cargoType) ? 'les envoyer' : 'l’envoyer';
   const unit = d.unit ?? 'unité';
 
@@ -458,7 +620,11 @@ function nextQuestion(d: Draft): { field: NonNullable<Draft['asked']>; text: str
 }
 
 function computeTotals(d: Draft) {
-  if (d.weightKg === undefined) return;
+  if (d.weightKg === undefined) {
+    d.totalWeightKg = undefined;
+    d.unitWeightKg = undefined;
+    return;
+  }
   if (!d.quantity || d.quantity === 1) {
     d.totalWeightKg = d.weightKg;
     d.unitWeightKg = d.weightKg;
@@ -474,6 +640,147 @@ function computeTotals(d: Draft) {
   }
 }
 
+/** Rappelle la question en cours après une réponse d'information. */
+function withReminder(reply: string, d: Draft): string {
+  if (!hasDraftContent(d)) return reply;
+  if (d.awaitingConfirm) {
+    return `${reply}\n\nVotre réservation attend toujours votre confirmation : souhaitez-vous la confirmer ?`;
+  }
+  const q = nextQuestion(d);
+  return q ? `${reply}\n\nPour poursuivre votre réservation : ${q.text}` : reply;
+}
+
+/* =========================================================
+   Réponses d'information lues dans PostgreSQL (aucune invention)
+========================================================= */
+const plural = (n: number, one: string, many: string) => (n > 1 ? many : one);
+
+async function answerBoats(qn: string): Promise<string> {
+  const { rows } = await defaultDb.query('SELECT * FROM boats ORDER BY name LIMIT 200');
+  const boats = rows.map((b) => ({
+    name: String(b.name ?? b.nom ?? 'Sans nom'),
+    capacity: b.capacity ?? b.capacite ?? null,
+    state: String(b.state ?? b.status ?? b.etat ?? '').trim(),
+  }));
+  if (boats.length === 0) return 'Aucun bateau n’est enregistré dans la base de données.';
+
+  const wantsAvailable = /dispon/.test(qn);
+  const wantsMaintenance = /maintenance|panne|repar/.test(qn);
+  const asksCount = /combien|nombre/.test(qn);
+  const keyword = wantsAvailable ? 'dispon' : wantsMaintenance ? 'maintenance' : null;
+  const selected = keyword ? boats.filter((b) => strip(b.state).includes(keyword)) : boats;
+
+  const counts = new Map<string, number>();
+  for (const b of boats) {
+    const k = b.state || 'état non renseigné';
+    counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const breakdown = Array.from(counts.entries())
+    .map(([state, n]) => `${state} (${n})`)
+    .join(', ');
+
+  const line = (b: (typeof boats)[number]) =>
+    `- ${b.name}${b.capacity != null ? ` — capacité : ${b.capacity}` : ''}${b.state ? ` — état : ${b.state}` : ''}`;
+
+  const what = wantsAvailable ? 'disponible' : 'en maintenance';
+
+  if (asksCount) {
+    const n = selected.length;
+    if (keyword) {
+      if (n === 0) {
+        return `Aucun bateau n’est indiqué comme ${what}. États enregistrés : ${breakdown}.`;
+      }
+      return `${n} ${plural(n, 'bateau est indiqué', 'bateaux sont indiqués')} comme ${what}${n > 1 && wantsAvailable ? 's' : ''}.\n${selected.slice(0, 10).map(line).join('\n')}`;
+    }
+    return `La base de données contient ${boats.length} ${plural(boats.length, 'bateau', 'bateaux')}. États : ${breakdown}.\n${boats.slice(0, 10).map(line).join('\n')}`;
+  }
+
+  if (selected.length === 0) {
+    return `Aucun bateau ne correspond à ce critère. États enregistrés : ${breakdown}.`;
+  }
+  return `Voici les bateaux enregistrés${keyword ? ` (${what})` : ''} :\n${selected.slice(0, 20).map(line).join('\n')}`;
+}
+
+async function answerTrips(question: string, places: string[]): Promise<string> {
+  const route = extractRoute(question, places, {}, undefined);
+  const date = parseRelativeDate(question);
+
+  const params: any[] = [];
+  const where: string[] = [];
+
+  if (date) {
+    params.push(date.dateStr);
+    where.push(`t.depart::date = $${params.length}::date`);
+  } else {
+    params.push(todayLocal());
+    where.push(`t.depart::date >= $${params.length}::date`);
+  }
+
+  if (route.departure && route.destination) {
+    params.push(likeParam(route.departure));
+    const a = params.length;
+    params.push(likeParam(route.destination));
+    const b = params.length;
+    where.push(`LOWER(t."from") LIKE $${a} ESCAPE '\\' AND LOWER(t."to") LIKE $${b} ESCAPE '\\'`);
+  } else if (route.departure || route.destination) {
+    params.push(likeParam((route.departure ?? route.destination)!));
+    const a = params.length;
+    where.push(`(LOWER(t."from") LIKE $${a} ESCAPE '\\' OR LOWER(t."to") LIKE $${a} ESCAPE '\\')`);
+  }
+
+  const { rows } = await defaultDb.query(
+    `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day,
+            to_char(t.depart::timestamp, 'HH24:MI') AS hour,
+            t."from" AS dep, t."to" AS dest, t.price_per_kg,
+            b.name AS boat_name, b.capacity, ${USED_SQL} AS used
+     FROM trips t
+     LEFT JOIN boats b ON t."boatId" = b.id
+     WHERE ${where.join(' AND ')}
+     ORDER BY t.depart ASC
+     LIMIT 8`,
+    params,
+  );
+
+  if (rows.length === 0) {
+    return date
+      ? `Je ne trouve aucun voyage le ${date.formatted} pour cette demande.`
+      : 'Je ne trouve aucun voyage à venir pour cette demande.';
+  }
+
+  const lines = rows.map((r) => {
+    const hour = r.hour && r.hour !== '00:00' ? ` à ${r.hour}` : '';
+    const boat = r.boat_name ? ` — navire ${r.boat_name}` : '';
+    const price =
+      Number(r.price_per_kg) > 0
+        ? ` — tarif : ${Number(r.price_per_kg).toLocaleString('fr-FR')} Ar/kg`
+        : '';
+    const left =
+      r.capacity != null
+        ? ` — capacité restante : ${Math.max(0, Number(r.capacity) - Number(r.used))} kg`
+        : '';
+    return `- ${formatFrShort(r.day)}${hour} : ${r.dep} → ${r.dest}${boat}${price}${left}`;
+  });
+
+  return `${date ? `Voyages du ${date.formatted}` : 'Prochains voyages'} :\n${lines.join('\n')}`;
+}
+
+/* =========================================================
+   Colonnes de la table reservations (insertion adaptée au schéma réel)
+========================================================= */
+let reservationColsCache = { at: 0, cols: new Set<string>() };
+
+async function getReservationColumns(db: Db): Promise<Set<string>> {
+  if (reservationColsCache.cols.size && Date.now() - reservationColsCache.at < 600_000) {
+    return reservationColsCache.cols;
+  }
+  const { rows } = await db.query(
+    `SELECT column_name FROM information_schema.columns
+     WHERE table_schema = current_schema() AND table_name = 'reservations'`,
+  );
+  reservationColsCache = { at: Date.now(), cols: new Set(rows.map((r) => String(r.column_name))) };
+  return reservationColsCache.cols;
+}
+
 /* =========================================================
    LLM Provider (Ollama local / OpenAI ou Groq en prod)
 ========================================================= */
@@ -485,17 +792,23 @@ interface ChatMessage {
 interface LLMOptions {
   temperature?: number;
   maxTokens?: number;
+  json?: boolean; // true par défaut : sortie JSON (extraction) ; false : texte libre
 }
 
 interface LLMProvider {
+  readonly name: string;
+  readonly model: string;
   chat(messages: ChatMessage[], options?: LLMOptions): Promise<string>;
 }
 
+const FETCH_TIMEOUT_MS = 25_000;
+
 class OllamaProvider implements LLMProvider {
-  constructor(private model = process.env.OLLAMA_MODEL || 'llama3.2') {}
+  readonly name = 'ollama';
+  readonly model = process.env.OLLAMA_MODEL || 'llama3.2';
 
   async chat(messages: ChatMessage[], options: LLMOptions = {}) {
-    // CORRIGÉ : 127.0.0.1 au lieu de localhost (Node résout parfois localhost en IPv6 ::1,
+    // 127.0.0.1 au lieu de localhost (Node résout parfois localhost en IPv6 ::1,
     // alors qu'Ollama écoute seulement en IPv4 → « fetch failed »)
     const res = await fetch(`${process.env.OLLAMA_URL || 'http://127.0.0.1:11434'}/api/chat`, {
       method: 'POST',
@@ -504,7 +817,7 @@ class OllamaProvider implements LLMProvider {
         model: this.model,
         messages,
         stream: false,
-        format: 'json', // CORRIGÉ : force une sortie JSON valide (sinon JSON.parse échoue → fallback)
+        ...(options.json === false ? {} : { format: 'json' }),
         options: {
           temperature: options.temperature ?? 0.05,
           num_predict: options.maxTokens ?? 512,
@@ -515,18 +828,17 @@ class OllamaProvider implements LLMProvider {
 
     if (!res.ok) throw new Error(`Ollama ${res.status}`);
 
-    const data = (await res.json()) as {
-      message?: { content?: string };
-    };
-
+    const data = (await res.json()) as { message?: { content?: string } };
     return data.message?.content ?? '';
   }
 }
 
 class OpenAIProvider implements LLMProvider {
+  readonly name = 'openai';
+  readonly model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+
   constructor(
     private apiKey = process.env.OPENAI_API_KEY!,
-    private model = process.env.OPENAI_MODEL || 'gpt-4o-mini',
     private baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
   ) {}
 
@@ -542,24 +854,25 @@ class OpenAIProvider implements LLMProvider {
         messages,
         temperature: options.temperature ?? 0.05,
         max_tokens: options.maxTokens ?? 512,
-        response_format: { type: 'json_object' },
+        ...(options.json === false ? {} : { response_format: { type: 'json_object' } }),
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
       const err = await res.text();
-      throw new Error(`OpenAI ${res.status}: ${err}`);
+      throw new Error(`OpenAI ${res.status}: ${err.slice(0, 300)}`);
     }
 
-    const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     return data.choices?.[0]?.message?.content ?? '';
   }
 }
 
 class GroqProvider implements LLMProvider {
+  readonly name = 'groq';
+  readonly model = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+
   constructor(private apiKey = process.env.GROQ_API_KEY!) {}
 
   async chat(messages: ChatMessage[], options: LLMOptions = {}) {
@@ -570,23 +883,21 @@ class GroqProvider implements LLMProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        model: process.env.GROQ_MODEL || 'llama-3.1-8b-instant',
+        model: this.model,
         messages,
         temperature: options.temperature ?? 0.05,
         max_tokens: options.maxTokens ?? 512,
-        response_format: { type: 'json_object' },
+        ...(options.json === false ? {} : { response_format: { type: 'json_object' } }),
       }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
 
     if (!res.ok) {
       const err = await res.text();
-      throw new Error(`Groq ${res.status}: ${err}`);
+      throw new Error(`Groq ${res.status}: ${err.slice(0, 300)}`);
     }
 
-    const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
+    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> };
     return data.choices?.[0]?.message?.content ?? '';
   }
 }
@@ -606,6 +917,51 @@ function createLLMProvider(): LLMProvider {
 
   return new OllamaProvider();
 }
+
+let providerCache: LLMProvider | null = null;
+function getProvider(): LLMProvider {
+  if (!providerCache) providerCache = createLLMProvider();
+  return providerCache;
+}
+
+const safeError = (e: unknown) =>
+  (e instanceof Error ? e.message : String(e)).replace(/(gsk_|sk-)[A-Za-z0-9_-]+/g, '***').slice(0, 200);
+
+/** Vérifie que le fournisseur IA répond (sans jamais renvoyer la clé). */
+aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) => {
+  const provider = getProvider();
+  const started = Date.now();
+  const keys = {
+    groq: Boolean(process.env.GROQ_API_KEY),
+    openai: Boolean(process.env.OPENAI_API_KEY),
+  };
+  try {
+    const out = await provider.chat(
+      [
+        { role: 'system', content: 'Réponds uniquement par le mot OK.' },
+        { role: 'user', content: 'Test' },
+      ],
+      { temperature: 0, maxTokens: 5, json: false },
+    );
+    return res.json({
+      ok: true,
+      provider: provider.name,
+      model: provider.model,
+      latencyMs: Date.now() - started,
+      sample: out.trim().slice(0, 20),
+      keys,
+    });
+  } catch (error) {
+    return res.status(503).json({
+      ok: false,
+      provider: provider.name,
+      model: provider.model,
+      latencyMs: Date.now() - started,
+      error: safeError(error),
+      keys,
+    });
+  }
+});
 
 const SYSTEM_PROMPT = `Tu es l'assistant de réservation de Saint-Jude (transport maritime Madagascar).
 Tu extrais UNIQUEMENT les informations fournies par le client. Tu n'inventes JAMAIS de prix, de disponibilité ou de date.
@@ -628,16 +984,44 @@ Règles strictes :
 - Une salutation (« bonjour », « salut », « merci »…) n'est JAMAIS une marchandise : mets tout à null.
 - cargoType = uniquement un produit réel (riz, sacs de ciment, meubles…), jamais « transport » ni « marchandise ».
 - Si le client dit seulement un nom de port, place-le selon le contexte (departure ou destination).
+- Si le client répond seulement par un nombre, place-le selon la question en cours (quantity ou weightKg).
 - Les ports connus sont fournis dynamiquement.
 - dateText = texte brut dit par le client ("demain", "vendredi prochain", "15 octobre"...).
 `;
 
+const GENERAL_PROMPT = `Tu es l'assistant de Saint-Jude, entreprise de transport maritime (passagers et marchandises) à Madagascar.
+Réponds en français, en 1 à 3 phrases courtes, de façon claire et utile.
+Tu n'as accès à AUCUNE donnée en temps réel : n'invente jamais de prix, d'horaire, de disponibilité, de numéro de réservation ni de chiffre. Pour ces informations, invite le client à préciser le trajet, la date et la marchandise afin que le système les vérifie, ou à poser une question sur les voyages, les tarifs ou les bateaux.
+Si la question n'a aucun rapport avec le transport maritime ou Saint-Jude, dis poliment que tu ne peux aider que pour les réservations et le transport.
+N'utilise pas de JSON.`;
+
+async function answerGeneral(question: string, places: string[]): Promise<string | null> {
+  try {
+    const provider = getProvider();
+    const out = await provider.chat(
+      [
+        {
+          role: 'system',
+          content: `${GENERAL_PROMPT}\nDate du jour : ${todayLocal()}. Ports connus : ${places.join(', ') || 'aucun'}.`,
+        },
+        { role: 'user', content: question },
+      ],
+      { temperature: 0.3, maxTokens: 300, json: false },
+    );
+    const text = out.trim();
+    return text ? text.slice(0, 800) : null;
+  } catch (err) {
+    console.warn(`[IA] réponse générale indisponible : ${safeError(err)}`);
+    return null;
+  }
+}
+
 /* =========================================================
-   Route /chat (hybride LLM + déterministe)
+   Route /chat (hybride : base de données + LLM + déterministe)
 ========================================================= */
 aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => {
   try {
-    const question = String(req.body?.question ?? '').trim();
+    const question = String(req.body?.question ?? '').trim().slice(0, 1000);
     if (!question) {
       return res.status(400).json({ error: 'Question requise' });
     }
@@ -650,86 +1034,148 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       /* contexte illisible → brouillon vide */
     }
 
-    const draft: Draft = { ...(parsedContext.currentContext ?? {}) };
+    // Plusieurs noms de clé acceptés ; tout est revalidé par sanitizeDraft
+    let draft: Draft = sanitizeDraft(
+      parsedContext.currentContext ?? parsedContext.updatedContext ?? parsedContext.draft,
+    );
+    computeTotals(draft);
+
     const text = question.toLowerCase();
+    const qn = strip(question).replace(/’/g, "'");
     const places = await getKnownPlaces();
-    let reply = '';
     let quoteSummary: Record<string, unknown> | null = null;
 
-    // ---- Confirmation oui/non
+    const send = (reply: string, extra: Record<string, unknown> = {}) =>
+      res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary, ...extra });
+
+    // ---- A. Annuler / recommencer
+    if (isRestartIntent(question)) {
+      draft = {};
+      const first = nextQuestion(draft)!;
+      draft.asked = first.field;
+      return send(`D’accord, on repart de zéro. ${first.text}`);
+    }
+    if (isCancelIntent(question)) {
+      if (/reserv/.test(qn) && !hasDraftContent(draft) && !draft.awaitingConfirm) {
+        return send(
+          'Je ne peux pas annuler une réservation déjà enregistrée depuis ce chat. Ouvrez-la dans la liste des réservations pour demander son annulation.',
+        );
+      }
+      draft = {};
+      return send('D’accord, la demande est annulée. Aucune réservation n’a été créée.');
+    }
+
+    // ---- B. Confirmation oui/non du récapitulatif
     if (draft.awaitingConfirm && isYes(question)) {
+      computeTotals(draft);
       const total = draft.totalWeightKg;
-      let reservationId: string | null = null; // CORRIGÉ : sert à prévenir le front
 
-      if (!draft.tripId || !draft.departure || !draft.destination || !draft.dateExact || !total) {
+      if (!draft.departure || !draft.destination || !draft.dateExact || !total) {
         draft.awaitingConfirm = false;
-        reply =
-          'Il manque des informations pour la réservation. Reprenons : ' +
-          (nextQuestion(draft)?.text ?? 'pouvez-vous reformuler ?');
-      } else {
-        const check = await verifyTrip({
-          depart: draft.departure,
-          arrivee: draft.destination,
-          date: draft.dateExact,
-          poidsTotalKg: total,
-        });
+        const q = nextQuestion(draft);
+        if (q) draft.asked = q.field;
+        return send(
+          `Il manque des informations pour la réservation. Reprenons : ${q?.text ?? 'pouvez-vous reformuler ?'}`,
+        );
+      }
 
-        if (!check.available) {
-          draft.awaitingConfirm = false;
-          reply = check.message ?? 'Ce trajet n’est plus disponible.';
+      const clientName = String(req.body?.clientName ?? '').trim().slice(0, 100) || 'Client IA';
+      const client = await pool.connect();
+      const tx = client as unknown as Db;
+
+      type Outcome = { ok: true; id: string; price: number } | { ok: false; message: string };
+      let outcome: Outcome;
+      try {
+        await client.query('BEGIN');
+
+        // 1) premier contrôle, puis verrou sur le voyage pour éviter les doubles réservations
+        const first = await verifyTrip(
+          { depart: draft.departure, arrivee: draft.destination, date: draft.dateExact, poidsTotalKg: total },
+          tx,
+        );
+        if (!first.available || !first.tripId) {
+          outcome = { ok: false, message: first.message ?? 'Ce trajet n’est plus disponible.' };
         } else {
-          const clientName = String(req.body?.clientName ?? 'Client IA');
+          await client.query('SELECT id FROM trips WHERE id = $1 FOR UPDATE', [first.tripId]);
 
-          // CORRIGÉ : transaction (tout est créé ou rien)
-          const client = await pool.connect();
-          try {
-            await client.query('BEGIN');
+          // 2) revérification sous verrou : la capacité est recalculée à jour
+          const check = await verifyTrip(
+            {
+              depart: draft.departure,
+              arrivee: draft.destination,
+              date: draft.dateExact,
+              poidsTotalKg: total,
+              tripId: first.tripId,
+            },
+            tx,
+          );
+          if (!check.available || !check.tripId) {
+            outcome = { ok: false, message: check.message ?? 'Ce trajet n’est plus disponible.' };
+          } else {
+            const price = check.totalPrice ?? 0;
+            const cols = await getReservationColumns(tx);
 
-            // CORRIGÉ : statut 'EN_ATTENTE' (attendu par le front) au lieu de 'PENDING'
+            // Statut 'EN_ATTENTE' (attendu par le front). Le paiement démarre à 0 Ar (Crédit).
+            const fields: Array<[string, unknown]> = [
+              ['clientName', clientName],
+              ['tripId', check.tripId],
+              ['quantity', draft.quantity || 1],
+              ['weight', total],
+              ['totalPrice', price],
+              ['status', 'EN_ATTENTE'],
+            ];
+            if (cols.has('amountPaid')) fields.push(['amountPaid', 0]);
+            if (cols.has('amountToPay')) fields.push(['amountToPay', price]);
+
+            const names = fields.map(([n]) => `"${n}"`).join(', ');
+            const slots = fields.map((_f, idx) => `$${idx + 1}`).join(', ');
             const insertRes = await client.query(
-              `INSERT INTO reservations (id, "clientName", "tripId", quantity, weight, "totalPrice", status, "createdAt")
-               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, 'EN_ATTENTE', NOW())
+              `INSERT INTO reservations (id, ${names}, "createdAt")
+               VALUES (gen_random_uuid(), ${slots}, NOW())
                RETURNING id;`,
-              [clientName, check.tripId, draft.quantity || 1, total, check.totalPrice ?? 0],
+              fields.map(([, v]) => v),
             );
-            reservationId = String(insertRes.rows[0].id);
 
             // --- À ACTIVER après avoir vérifié les colonnes réelles de la table goods ---
             // await client.query(
             //   `INSERT INTO goods (id, "reservationId", name, quantity, weight)
             //    VALUES (gen_random_uuid(), $1, $2, $3, $4);`,
-            //   [reservationId, draft.cargoType ?? 'Marchandise', draft.quantity || 1, total],
+            //   [insertRes.rows[0].id, draft.cargoType ?? 'Marchandise', draft.quantity || 1, total],
             // );
 
-            await client.query('COMMIT');
-          } catch (txError) {
-            await client.query('ROLLBACK');
-            throw txError;
-          } finally {
-            client.release();
+            outcome = { ok: true, id: String(insertRes.rows[0].id), price };
           }
-
-          reply = `Merci ! Votre réservation a été enregistrée avec succès sous le numéro #${reservationId.slice(0, 8)}.`;
-          draft.confirmedByUser = true;
-          draft.awaitingConfirm = false;
         }
+
+        await client.query(outcome.ok ? 'COMMIT' : 'ROLLBACK');
+      } catch (txError) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw txError;
+      } finally {
+        client.release();
       }
 
-      // CORRIGÉ : indicateurs pour que le front recharge le tableau
-      return res.json({
-        reply,
-        reponse: reply,
-        updatedContext: draft,
-        quoteSummary,
-        reservationCreated: reservationId !== null,
-        reservationId,
-      });
-    }
-    if (draft.awaitingConfirm && isNo(question)) {
-      draft.awaitingConfirm = false;
+      if (!outcome.ok) {
+        draft.awaitingConfirm = false;
+        return send(`${outcome.message} Souhaitez-vous une autre date ou un autre trajet ?`);
+      }
+
+      draft = {};
+      quoteSummary = null;
+      return send(
+        `Votre réservation a été enregistrée sous le numéro #${outcome.id.slice(0, 8)} avec le statut « En attente ». Montant à payer : ${outcome.price.toLocaleString('fr-FR')} Ar.`,
+        { reservationCreated: true, reservationId: outcome.id },
+      );
     }
 
-    // ---- Confirmation date ambiguë
+    if (draft.awaitingConfirm && isNo(question)) {
+      draft.awaitingConfirm = false;
+      return send(
+        'D’accord, rien n’est enregistré. Que souhaitez-vous modifier (trajet, date, quantité, poids, marchandise) ? Vous pouvez aussi dire « annuler ».',
+      );
+    }
+
+    // ---- C. Confirmation date ambiguë
     if (draft.dateToConfirm) {
       if (isYes(question)) {
         draft.dateToConfirm = false;
@@ -742,41 +1188,66 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       }
     }
 
-    // ---- 0. Salutation seule : on répond poliment et on repose la question en cours
+    // ---- D. Salutation / bavardage : réponse polie puis question en cours
     if (isPureGreeting(question) || isSmallTalk(question)) {
       const q0 = nextQuestion(draft);
       if (q0) draft.asked = q0.field;
       const rest = q0 ? q0.text.replace(/^(D’accord|Très bien)[^!.]*[!.]\s*/, '') : '';
       const hello = isSmallTalk(question) ? 'Je vais bien, merci !' : 'Bonjour !';
-      reply = rest
-        ? `${hello} Je vous aide à préparer votre réservation. ${rest}`
-        : `${hello} Dites-moi ce que vous souhaitez envoyer, vers où et à quelle date.`;
-      return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+      return send(
+        rest
+          ? `${hello} Je vous aide à préparer votre réservation. ${rest}`
+          : `${hello} Dites-moi ce que vous souhaitez envoyer, vers où et à quelle date.`,
+      );
     }
 
-    // ---- 1. Extraction (LLM d’abord, fallback déterministe)
-    const before = { ...draft };
+    // ---- E. Questions d'information : réponses lues dans PostgreSQL
+    if (!RESERVATION_WORDS.test(qn)) {
+      if (BOAT_WORDS.test(qn) && (looksLikeQuestion(question) || /liste|combien|nombre|dispon|maintenance|capacite/.test(qn))) {
+        try {
+          return send(withReminder(await answerBoats(qn), draft));
+        } catch (err) {
+          console.error('[IA] bateaux :', err);
+          return send('Je n’ai pas pu consulter la liste des bateaux pour le moment. Réessayez dans un instant.');
+        }
+      }
+      if (TRIP_WORDS.test(qn) && looksLikeQuestion(question)) {
+        try {
+          return send(withReminder(await answerTrips(question, places), draft));
+        } catch (err) {
+          console.error('[IA] voyages :', err);
+          return send('Je n’ai pas pu consulter les voyages pour le moment. Réessayez dans un instant.');
+        }
+      }
+    }
 
+    // ---- F. Extraction (LLM d’abord, fallback déterministe)
+    const before: Draft = { ...draft };
+    let dateText: string | null = null;
     let llmOk = false;
+
     try {
-      const llm = createLLMProvider();
+      const llm = getProvider();
+      const asked = draft.asked ? `\nLa dernière question posée au client portait sur : ${draft.asked}.` : '';
       const messages: ChatMessage[] = [
         {
           role: 'system',
-          content: SYSTEM_PROMPT + `\nPorts connus : ${places.join(', ')}`,
+          content: `${SYSTEM_PROMPT}\nPorts connus : ${places.join(', ')}${asked}`,
         },
         { role: 'user', content: question },
       ];
       const raw = await llm.chat(messages, { temperature: 0.05 });
       const extracted = parseJsonLoose(raw);
-      console.info('[IA] extraction LLM OK :', extracted);
+      console.info(`[IA] extraction OK (${llm.name}/${llm.model})`);
 
-      // CORRIGÉ : on valide ce que renvoie le LLM au lieu de lui faire confiance
+      // On valide ce que renvoie le LLM au lieu de lui faire confiance
       if (isValidCargo(extracted.cargoType, places)) draft.cargoType = extracted.cargoType.trim();
       if (typeof extracted.unit === 'string' && extracted.unit) draft.unit = singular(extracted.unit);
-      if (typeof extracted.quantity === 'number') draft.quantity = extracted.quantity;
-      if (typeof extracted.weightKg === 'number') {
-        draft.weightKg = extracted.weightKg;
+      const qty = Number(extracted.quantity);
+      if (Number.isInteger(qty) && qty > 0 && qty <= 100_000) draft.quantity = qty;
+      const wkg = Number(extracted.weightKg);
+      if (Number.isFinite(wkg) && wkg > 0 && wkg <= 1_000_000) {
+        draft.weightKg = wkg;
         draft.weightMode = undefined;
       }
       if (extracted.weightMode === 'unit' || extracted.weightMode === 'total') {
@@ -796,33 +1267,12 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
         }
       }
 
-      if (extracted.dateText) {
-        const dateParsed = parseRelativeDate(extracted.dateText);
-        if (dateParsed) {
-          if (dateParsed.dateStr < todayLocal()) {
-            delete draft.dateExact;
-            delete draft.dateFormatted;
-            draft.asked = 'date';
-            reply = 'La date indiquée est déjà passée. Pour quelle date souhaitez-vous organiser le transport ?';
-            return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
-          }
-          draft.dateExact = dateParsed.dateStr;
-          draft.dateFormatted = dateParsed.formatted;
-          if (dateParsed.ambiguous) {
-            draft.dateToConfirm = true;
-            draft.asked = 'date';
-            reply = `Aujourd’hui, c’est déjà ${DAY_NAMES[new Date(`${todayLocal()}T12:00:00Z`).getUTCDay()]}. Parlez-vous de ${dateParsed.formatted} ?`;
-            return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
-          }
-        }
-      }
+      if (typeof extracted.dateText === 'string') dateText = extracted.dateText;
       llmOk = true;
     } catch (err) {
-      const detail = err instanceof Error ? `${err.message} | cause: ${String((err as any).cause ?? '-')}` : String(err);
-      console.warn(`[IA] LLM indisponible → fallback déterministe : ${detail}`);
+      console.warn(`[IA] LLM indisponible → fallback déterministe : ${safeError(err)}`);
     }
 
-    // Fallback déterministe
     if (!llmOk) {
       const goods = extractGoods(text, places);
       if (isValidCargo(goods.cargoType, places)) draft.cargoType = goods.cargoType;
@@ -867,44 +1317,68 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
         draft.weightMode = 'total';
       }
 
-      const lone = strip(text).replace(/[.!?]+$/, '');
-      const loneNum = /^\d{1,5}$/.test(lone) ? +lone : (NUM_WORDS[lone] as number | undefined);
-      if (loneNum !== undefined && !w) {
-        if (draft.asked === 'quantity') draft.quantity = loneNum;
-        else if (draft.asked === 'weight') {
-          draft.weightKg = loneNum;
-          draft.weightMode = undefined;
-        }
-      }
-      if (!route.departure && !route.destination && draft.asked && /^(departure|destination)$/.test(draft.asked)) {
-        const only = found1(places, lone);
+      if (!route.departure && !route.destination && (draft.asked === 'departure' || draft.asked === 'destination')) {
+        const only = found1(places, strip(text).replace(/[.!?]+$/, ''));
         if (only) {
           if (draft.asked === 'departure') draft.departure = only;
           else draft.destination = only;
         }
       }
+    }
 
-      const dateParsed = parseRelativeDate(text);
-      if (dateParsed) {
-        if (dateParsed.dateStr < todayLocal()) {
-          delete draft.dateExact;
-          delete draft.dateFormatted;
-          draft.asked = 'date';
-          reply = 'La date indiquée est déjà passée. Pour quelle date souhaitez-vous organiser le transport ?';
-          return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
-        }
-        draft.dateExact = dateParsed.dateStr;
-        draft.dateFormatted = dateParsed.formatted;
-        if (dateParsed.ambiguous) {
-          draft.dateToConfirm = true;
-          draft.asked = 'date';
-          reply = `Aujourd’hui, c’est déjà ${DAY_NAMES[new Date(`${todayLocal()}T12:00:00Z`).getUTCDay()]}. Parlez-vous de ${dateParsed.formatted} ?`;
-          return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
-        }
+    // Réponse d'un seul nombre à la question en cours (quantité ou poids), quel que soit le chemin
+    const lone = qn.replace(/[.!?]+$/, '');
+    const loneNum = /^\d{1,6}(?:[.,]\d+)?$/.test(lone)
+      ? parseFloat(lone.replace(',', '.'))
+      : (NUM_WORDS[lone] as number | undefined);
+    if (loneNum !== undefined && loneNum > 0) {
+      if (draft.asked === 'quantity' && Number.isInteger(loneNum)) {
+        draft.quantity = loneNum;
+        draft.weightKg = before.weightKg;
+        draft.weightMode = before.weightMode;
+      } else if (draft.asked === 'weight') {
+        draft.weightKg = loneNum;
+        draft.weightMode = undefined;
+        draft.quantity = before.quantity;
+      }
+    }
+
+    // Réponse à « poids de chaque colis ou poids total ? »
+    if (draft.asked === 'weightMode' && !draft.weightMode) {
+      if (/\b(chaque|chacun|chacune|par\s+[a-z]+|l'unite)\b/.test(qn)) draft.weightMode = 'unit';
+      else if (/\b(total|ensemble|en tout)\b/.test(qn)) draft.weightMode = 'total';
+    }
+
+    // Date : texte du LLM, sinon message brut
+    const dateParsed = parseRelativeDate(dateText ?? '') ?? parseRelativeDate(question);
+    if (dateParsed) {
+      if (dateParsed.dateStr < todayLocal()) {
+        delete draft.dateExact;
+        delete draft.dateFormatted;
+        draft.asked = 'date';
+        return send('La date indiquée est déjà passée. Pour quelle date souhaitez-vous organiser le transport ?');
+      }
+      draft.dateExact = dateParsed.dateStr;
+      draft.dateFormatted = dateParsed.formatted;
+      if (dateParsed.ambiguous) {
+        draft.dateToConfirm = true;
+        draft.asked = 'date';
+        return send(
+          `Aujourd’hui, c’est déjà ${DAY_NAMES[new Date(`${todayLocal()}T12:00:00Z`).getUTCDay()]}. Parlez-vous de ${dateParsed.formatted} ?`,
+        );
       }
     }
 
     computeTotals(draft);
+    const draftChanged = dataSig(before) !== dataSig(draft);
+
+    // ---- G. Aucune information utile et c'est une question → réponse pertinente, sans inventer
+    if (!draftChanged && looksLikeQuestion(question)) {
+      const answer =
+        (await answerGeneral(question, places)) ??
+        'Je n’ai pas bien compris votre question. Je peux préparer une réservation, consulter les voyages, les tarifs ou les bateaux.';
+      return send(withReminder(answer, draft));
+    }
 
     // Corrections signalées
     const changed: string[] = [];
@@ -917,16 +1391,19 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     if (before.quantity && draft.quantity !== before.quantity) changed.push(`quantité : ${draft.quantity}`);
     const prefix = changed.length ? `C’est corrigé (${changed.join(', ')}). ` : '';
 
-    // ---- 2. Une seule question ciblée
+    // ---- H. Une seule question ciblée
     const q = nextQuestion(draft);
     if (q) {
+      const misunderstood = !draftChanged && !!draft.asked;
       draft.asked = q.field;
       draft.awaitingConfirm = false;
-      reply = `${prefix}${q.text}`;
-      return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+      const body = misunderstood
+        ? `Je n’ai pas bien compris votre réponse. ${q.text.replace(/^(?:D’accord[^!]*!|Très bien\.)\s*/, '')}`
+        : `${prefix}${q.text}`;
+      return send(body);
     }
 
-    // ---- 3. Tout est connu → vérification SQL obligatoire
+    // ---- I. Tout est connu → vérification SQL obligatoire
     draft.asked = undefined;
     const result = await verifyTrip({
       depart: draft.departure!,
@@ -935,10 +1412,12 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       poidsTotalKg: draft.totalWeightKg,
     });
 
+    let reply: string;
     if (!result.available) {
       reply = `${prefix}${result.message ?? 'Ce trajet n’est pas disponible pour cette demande.'} Souhaitez-vous une autre date ou un autre trajet ?`;
       draft.awaitingConfirm = false;
     } else {
+      // tripId, prix et navire sont informatifs ici : ils sont recalculés à la confirmation
       draft.tripId = result.tripId;
       draft.estimatedPrice = result.totalPrice ?? 0;
       draft.boatName = result.boatName;
@@ -961,7 +1440,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       };
     }
 
-    return res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary });
+    return send(reply);
   } catch (error) {
     console.error('Erreur IA / Neon:', error);
     return res.status(500).json({ error: 'Erreur lors du traitement de la demande' });
