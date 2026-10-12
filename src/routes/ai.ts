@@ -192,6 +192,7 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
+       AND (b.id IS NULL OR LOWER(COALESCE(b.state, '')) NOT LIKE '%maintenance%')
      ORDER BY t.depart ASC`,
     params,
   );
