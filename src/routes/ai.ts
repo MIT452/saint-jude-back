@@ -176,8 +176,8 @@ const TRIP_ACTIVE = `UPPER(COALESCE(t.status, '')) NOT LIKE 'ANNUL%'`;
 
 const TRIP_FILTER = `LOWER(t."from") LIKE $1 ESCAPE '\\' AND LOWER(t."to") LIKE $2 ESCAPE '\\' AND ${TRIP_ACTIVE}`;
 
-// Valeur initiale de reservations."paymentStatus" (à aligner sur celle de votre application)
-const PAYMENT_STATUS_INIT = 'Crédit';
+// reservations."paymentStatus" est un booléen (affiché f / t) : false = non payé
+const PAYMENT_STATUS_INIT = false;
 
 // Les réservations annulées ou refusées ne consomment pas de capacité
 const USED_SQL = `COALESCE((SELECT SUM(r.weight) FROM reservations r
