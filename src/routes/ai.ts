@@ -4,6 +4,11 @@ import { pool } from '../db.js';
 
 export const aiRouter = Router();
 
+// Marqueur de version : visible dans les logs et dans GET /api/ai/status
+// → permet de vérifier que le serveur exécute bien CE fichier.
+const BUILD = 'ai-2026-10-13-boats-fix';
+console.info(`[IA] ai.ts chargé (build ${BUILD})`);
+
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
 type Db = { query: (text: string, values?: any[]) => Promise<{ rows: any[] }> };
 const defaultDb = pool as unknown as Db;
@@ -514,7 +519,11 @@ const looksLikeQuestion = (t: string) =>
 // Une demande de réservation contient ces mots : ce n'est pas une simple question d'information
 const RESERVATION_WORDS =
   /\b(reserver|envoyer|expedier|transporter|acheminer|colis|sacs?|cartons?|caisses?|kg|kilos?|tonnes?|passagers?)\b/;
-const BOAT_WORDS = /\b(bateau|bateaux|navire|navires)\b/;
+// Tolère les fautes courantes : « bato », « combient », « combiens »
+const BOAT_WORDS = /\b(bateaux?|batos?|navires?)\b/;
+const COUNT_WORDS = /\b(combien[st]?|nombre)\b/;
+// Mots qui, avec « bateau », indiquent une question d'information (« existent », « liste »…)
+const BOAT_INFO_WORDS = /liste|exist|dispon|maintenance|capacite|etat|statut/;
 const TRIP_WORDS =
   /\b(voyage|voyages|trajet|trajets|depart|departs|horaire|horaires|prochain|prochains|tarif|tarifs|prix|cout|coute)\b/;
 
@@ -666,7 +675,7 @@ async function answerBoats(qn: string): Promise<string> {
 
   const wantsAvailable = /dispon/.test(qn);
   const wantsMaintenance = /maintenance|panne|repar/.test(qn);
-  const asksCount = /combien|nombre/.test(qn);
+  const asksCount = COUNT_WORDS.test(qn);
   const keyword = wantsAvailable ? 'dispon' : wantsMaintenance ? 'maintenance' : null;
   const selected = keyword ? boats.filter((b) => strip(b.state).includes(keyword)) : boats;
 
@@ -945,6 +954,7 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
     );
     return res.json({
       ok: true,
+      build: BUILD,
       provider: provider.name,
       model: provider.model,
       latencyMs: Date.now() - started,
@@ -954,6 +964,7 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
   } catch (error) {
     return res.status(503).json({
       ok: false,
+      build: BUILD,
       provider: provider.name,
       model: provider.model,
       latencyMs: Date.now() - started,
@@ -1025,6 +1036,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     if (!question) {
       return res.status(400).json({ error: 'Question requise' });
     }
+    console.info(`[IA] /chat build=${BUILD} question="${question.slice(0, 120)}"`);
 
     let parsedContext: Record<string, any> = {};
     try {
@@ -1203,7 +1215,10 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
 
     // ---- E. Questions d'information : réponses lues dans PostgreSQL
     if (!RESERVATION_WORDS.test(qn)) {
-      if (BOAT_WORDS.test(qn) && (looksLikeQuestion(question) || /liste|combien|nombre|dispon|maintenance|capacite/.test(qn))) {
+      if (
+        BOAT_WORDS.test(qn) &&
+        (looksLikeQuestion(question) || COUNT_WORDS.test(qn) || BOAT_INFO_WORDS.test(qn))
+      ) {
         try {
           return send(withReminder(await answerBoats(qn), draft));
         } catch (err) {
