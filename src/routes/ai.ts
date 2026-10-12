@@ -171,7 +171,13 @@ export interface VerifyResult {
 // % et _ saisis par l'utilisateur sont échappés : ce ne sont pas des jokers
 const likeParam = (s: string) => `%${s.trim().toLowerCase().replace(/[\\%_]/g, '\\$&')}%`;
 
-const TRIP_FILTER = `LOWER(t."from") LIKE $1 ESCAPE '\\' AND LOWER(t."to") LIKE $2 ESCAPE '\\'`;
+// Les voyages annulés ne sont jamais proposés
+const TRIP_ACTIVE = `UPPER(COALESCE(t.status, '')) NOT LIKE 'ANNUL%'`;
+
+const TRIP_FILTER = `LOWER(t."from") LIKE $1 ESCAPE '\\' AND LOWER(t."to") LIKE $2 ESCAPE '\\' AND ${TRIP_ACTIVE}`;
+
+// Valeur initiale de reservations."paymentStatus" (à aligner sur celle de votre application)
+const PAYMENT_STATUS_INIT = 'Crédit';
 
 // Les réservations annulées ou refusées ne consomment pas de capacité
 const USED_SQL = `COALESCE((SELECT SUM(r.weight) FROM reservations r
@@ -188,7 +194,7 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
   const params = [likeParam(i.depart), likeParam(i.arrivee), i.date];
 
   const { rows: allRows } = await db.query(
-    `SELECT t.id, t.price_per_kg, b.name AS boat_name, b.capacity, ${USED_SQL} AS used
+    `SELECT t.id, t."pricePerKg" AS price_per_kg, b.name AS boat_name, b.capacity, ${USED_SQL} AS used
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
@@ -716,7 +722,7 @@ async function answerTrips(question: string, places: string[]): Promise<string> 
   const date = parseRelativeDate(question);
 
   const params: any[] = [];
-  const where: string[] = [];
+  const where: string[] = [TRIP_ACTIVE];
 
   if (date) {
     params.push(date.dateStr);
@@ -741,7 +747,7 @@ async function answerTrips(question: string, places: string[]): Promise<string> 
   const { rows } = await defaultDb.query(
     `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day,
             to_char(t.depart::timestamp, 'HH24:MI') AS hour,
-            t."from" AS dep, t."to" AS dest, t.price_per_kg,
+            t."from" AS dep, t."to" AS dest, t."pricePerKg" AS price_per_kg,
             b.name AS boat_name, b.capacity, ${USED_SQL} AS used
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
@@ -1139,12 +1145,15 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
             ];
             if (cols.has('amountPaid')) fields.push(['amountPaid', 0]);
             if (cols.has('amountToPay')) fields.push(['amountToPay', price]);
+            // La table reservations n'a pas de "createdAt" : la date est dans la colonne "date"
+            if (cols.has('date')) fields.push(['date', new Date().toISOString()]);
+            if (cols.has('paymentStatus')) fields.push(['paymentStatus', PAYMENT_STATUS_INIT]);
 
             const names = fields.map(([n]) => `"${n}"`).join(', ');
             const slots = fields.map((_f, idx) => `$${idx + 1}`).join(', ');
             const insertRes = await client.query(
-              `INSERT INTO reservations (id, ${names}, "createdAt")
-               VALUES (gen_random_uuid(), ${slots}, NOW())
+              `INSERT INTO reservations (id, ${names})
+               VALUES (gen_random_uuid(), ${slots})
                RETURNING id;`,
               fields.map(([, v]) => v),
             );
