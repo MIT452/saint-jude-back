@@ -156,6 +156,7 @@ export interface VerifyInput {
   arrivee: string;
   date: string; // YYYY-MM-DD
   poidsTotalKg?: number;
+  quantite?: number; // places / colis : la capacité d'un bateau (boats.capacity) est en places
   passagers?: number;
   tripId?: string; // restreint la vérification à un voyage précis (après verrouillage)
 }
@@ -179,12 +180,12 @@ const TRIP_FILTER = `LOWER(t."from") LIKE $1 ESCAPE '\\' AND LOWER(t."to") LIKE 
 // reservations."paymentStatus" est un booléen (affiché f / t) : false = non payé
 const PAYMENT_STATUS_INIT = false;
 
-// Les réservations annulées ou refusées ne consomment pas de capacité
-const USED_SQL = `COALESCE((SELECT SUM(r.weight) FROM reservations r
+// Capacité en PLACES (somme des quantités), comme le garde-fou de server.ts (capacityGuard.ts).
+// Les réservations refusées, annulées ou no-show ne consomment pas de place.
+const USED_SQL = `COALESCE((SELECT SUM(r.quantity) FROM reservations r
                     WHERE r."tripId" = t.id
-                      AND UPPER(r.status) NOT LIKE 'ANNUL%'
-                      AND UPPER(r.status) NOT LIKE 'CANCEL%'
-                      AND UPPER(r.status) NOT LIKE 'REFUS%'), 0)`;
+                      AND UPPER(COALESCE(r.status, '')) NOT IN
+                        ('REFUSEE', 'REFUSÉE', 'ANNULEE', 'ANNULÉE', 'CANCELLED', 'NO_SHOW', 'NO-SHOW')), 0)`;
 
 export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<VerifyResult> {
   if (i.date < todayLocal()) {
@@ -221,14 +222,15 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
   }
 
   const needKg = i.poidsTotalKg ?? 0;
+  const needQty = i.quantite ?? 0;
   const trip = rows.find(
-    (r) => r.capacity == null || Number(r.capacity) - Number(r.used) >= needKg,
+    (r) => r.capacity == null || Number(r.capacity) - Number(r.used) >= needQty,
   );
   if (!trip) {
     const left = Math.max(0, Number(rows[0].capacity) - Number(rows[0].used));
     return {
       available: false,
-      message: `Le navire est complet pour cette date : il reste ${left} kg pour ${needKg} kg demandés.`,
+      message: `Le navire est complet pour cette date : il reste ${left} place(s) pour ${needQty} demandée(s).`,
     };
   }
 
@@ -272,7 +274,14 @@ function readVerifyBody(body: any): { value: VerifyInput } | { error: string } {
       return { error: 'passagers invalide' };
     }
   }
-  return { value: { depart, arrivee, date, poidsTotalKg, passagers } };
+  let quantite: number | undefined;
+  if (body?.quantite !== undefined && body?.quantite !== null) {
+    quantite = Number(body.quantite);
+    if (!Number.isInteger(quantite) || quantite < 1 || quantite > 100_000) {
+      return { error: 'quantite invalide' };
+    }
+  }
+  return { value: { depart, arrivee, date, poidsTotalKg, quantite, passagers } };
 }
 
 aiRouter.post('/verify', aiRequestLimiter, async (req: Request, res: Response) => {
@@ -772,7 +781,7 @@ async function answerTrips(question: string, places: string[]): Promise<string> 
         : '';
     const left =
       r.capacity != null
-        ? ` — capacité restante : ${Math.max(0, Number(r.capacity) - Number(r.used))} kg`
+        ? ` — places restantes : ${Math.max(0, Number(r.capacity) - Number(r.used))}`
         : '';
     return `- ${formatFrShort(r.day)}${hour} : ${r.dep} → ${r.dest}${boat}${price}${left}`;
   });
@@ -1099,6 +1108,8 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       }
 
       const clientName = String(req.body?.clientName ?? '').trim().slice(0, 100) || 'Client IA';
+      // requireAuth place l'utilisateur connecté ici : il devient le propriétaire (userId) de la réservation
+      const sessionUser = res.locals.sessionUser as { id?: string } | undefined;
       const client = await pool.connect();
       const tx = client as unknown as Db;
 
@@ -1109,7 +1120,13 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
 
         // 1) premier contrôle, puis verrou sur le voyage pour éviter les doubles réservations
         const first = await verifyTrip(
-          { depart: draft.departure, arrivee: draft.destination, date: draft.dateExact, poidsTotalKg: total },
+          {
+            depart: draft.departure,
+            arrivee: draft.destination,
+            date: draft.dateExact,
+            poidsTotalKg: total,
+            quantite: draft.quantity || 1,
+          },
           tx,
         );
         if (!first.available || !first.tripId) {
@@ -1124,6 +1141,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
               arrivee: draft.destination,
               date: draft.dateExact,
               poidsTotalKg: total,
+              quantite: draft.quantity || 1,
               tripId: first.tripId,
             },
             tx,
@@ -1148,6 +1166,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
             // La table reservations n'a pas de "createdAt" : la date est dans la colonne "date"
             if (cols.has('date')) fields.push(['date', new Date().toISOString()]);
             if (cols.has('paymentStatus')) fields.push(['paymentStatus', PAYMENT_STATUS_INIT]);
+            if (cols.has('userId') && sessionUser?.id) fields.push(['userId', sessionUser.id]);
 
             const names = fields.map(([n]) => `"${n}"`).join(', ');
             const slots = fields.map((_f, idx) => `$${idx + 1}`).join(', ');
@@ -1158,14 +1177,31 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
               fields.map(([, v]) => v),
             );
 
-            // --- À ACTIVER après avoir vérifié les colonnes réelles de la table goods ---
-            // await client.query(
-            //   `INSERT INTO goods (id, "reservationId", name, quantity, weight)
-            //    VALUES (gen_random_uuid(), $1, $2, $3, $4);`,
-            //   [insertRes.rows[0].id, draft.cargoType ?? 'Marchandise', draft.quantity || 1, total],
-            // );
+            // Ligne goods : c'est elle qui alimente la colonne « Marchandise » du tableau des réservations
+            const reservationId = String(insertRes.rows[0].id);
+            const qty = draft.quantity || 1;
+            const itemName = (draft.cargoType ?? 'Marchandise').replace(/^./, (c) => c.toUpperCase());
+            await client.query(
+              `INSERT INTO goods (id, "itemName", types, "embarkDate", quantity, "unitWeight", "totalWeight",
+                                  "unitPrice", "totalPrice", "amountToPay", status, "reservationId", "userId", "tripId")
+               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11, $12)`,
+              [
+                itemName,
+                draft.unit ?? null,
+                draft.dateExact,
+                qty,
+                Math.round((total / qty) * 100) / 100,
+                total,
+                Math.round((price / qty) * 100) / 100,
+                price,
+                price,
+                reservationId,
+                sessionUser?.id ?? null,
+                check.tripId,
+              ],
+            );
 
-            outcome = { ok: true, id: String(insertRes.rows[0].id), price };
+            outcome = { ok: true, id: reservationId, price };
           }
         }
 
@@ -1435,6 +1471,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       arrivee: draft.destination!,
       date: draft.dateExact!,
       poidsTotalKg: draft.totalWeightKg,
+      quantite: draft.quantity || 1,
     });
 
     let reply: string;
