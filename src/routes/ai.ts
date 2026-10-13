@@ -6,7 +6,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-14-goods-icon-fallback';
+const BUILD = 'ai-2026-10-14-goods-icon-fallback-trim';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -839,7 +839,7 @@ const FETCH_TIMEOUT_MS = 25_000;
 
 class OllamaProvider implements LLMProvider {
   readonly name = 'ollama';
-  readonly model = process.env.OLLAMA_MODEL || 'llama3.2';
+  readonly model = (process.env.OLLAMA_MODEL || 'llama3.2').trim();
 
   async chat(messages: ChatMessage[], options: LLMOptions = {}) {
     // 127.0.0.1 au lieu de localhost (Node résout parfois localhost en IPv6 ::1,
@@ -869,10 +869,10 @@ class OllamaProvider implements LLMProvider {
 
 class OpenAIProvider implements LLMProvider {
   readonly name = 'openai';
-  readonly model = process.env.OPENAI_MODEL || 'gpt-4o-mini';
+  readonly model = (process.env.OPENAI_MODEL || 'gpt-4o-mini').trim();
 
   constructor(
-    private apiKey = process.env.OPENAI_API_KEY!,
+    private apiKey = (process.env.OPENAI_API_KEY ?? '').trim(),
     private baseUrl = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1',
   ) {}
 
@@ -905,9 +905,9 @@ class OpenAIProvider implements LLMProvider {
 
 class GroqProvider implements LLMProvider {
   readonly name = 'groq';
-  readonly model = process.env.GROQ_MODEL || 'llama-3.1-8b-instant';
+  readonly model = (process.env.GROQ_MODEL || 'llama-3.1-8b-instant').trim();
 
-  constructor(private apiKey = process.env.GROQ_API_KEY!) {}
+  constructor(private apiKey = (process.env.GROQ_API_KEY ?? '').trim()) {}
 
   async chat(messages: ChatMessage[], options: LLMOptions = {}) {
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
