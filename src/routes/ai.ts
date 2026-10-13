@@ -6,7 +6,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-14-goods-icon-fallback-trim';
+const BUILD = 'ai-2026-10-14-goods-icon-gptoss';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -905,7 +905,8 @@ class OpenAIProvider implements LLMProvider {
 
 class GroqProvider implements LLMProvider {
   readonly name = 'groq';
-  readonly model = (process.env.GROQ_MODEL || 'llama-3.1-8b-instant').trim();
+  // llama-3.1-8b-instant est arrêté chez Groq (16/08/2026) : remplaçant officiel openai/gpt-oss-20b
+  readonly model = (process.env.GROQ_MODEL || 'openai/gpt-oss-20b').trim();
 
   constructor(private apiKey = (process.env.GROQ_API_KEY ?? '').trim()) {}
 
@@ -920,7 +921,9 @@ class GroqProvider implements LLMProvider {
         model: this.model,
         messages,
         temperature: options.temperature ?? 0.05,
-        max_tokens: options.maxTokens ?? 512,
+        // les modèles gpt-oss « réfléchissent » : leur raisonnement consomme aussi des tokens
+        max_tokens: (options.maxTokens ?? 512) + (this.model.includes('gpt-oss') ? 400 : 0),
+        ...(this.model.includes('gpt-oss') ? { reasoning_effort: 'low' } : {}),
         ...(options.json === false ? {} : { response_format: { type: 'json_object' } }),
       }),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
