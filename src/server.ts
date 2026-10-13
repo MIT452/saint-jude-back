@@ -20,6 +20,7 @@ import authRouter from './routes/auth.js';
 import { requireAuth, requireOwner, requireTrustedOrigin } from './utils/authSession.js';
 import { pool } from './db.js';
 import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
+import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // AJOUT AIOPS 1/3
 
 const app = express();
 
@@ -50,6 +51,8 @@ app.use(express.json({ limit: '15mb' }));
 
 app.use(traceRequest);
 
+app.use(metricsMiddleware); // AJOUT AIOPS 2/3 : doit rester AVANT les routes
+
 app.use(morgan('dev'));
 app.use('/api', requireTrustedOrigin);
 
@@ -73,6 +76,14 @@ app.get('/api/health/database', async (_req, res) => {
     res.status(503).json({ status: 'error', provider: 'postgresql', error: 'Connexion à la base indisponible' });
   }
 });
+
+/* =========================
+   MÉTRIQUES (AIOPS)
+   Hors /api : pas soumis à requireTrustedOrigin.
+   Protégée par METRICS_TOKEN (Bearer) dans metricsHandler.
+========================= */
+
+app.get('/metrics', metricsHandler); // AJOUT AIOPS 3/3
 
 app.use('/api/auth', authRouter);
 
