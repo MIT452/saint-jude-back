@@ -6,7 +6,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-13-boats-fix';
+const BUILD = 'ai-2026-10-13-reserve';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -164,8 +164,12 @@ export interface VerifyInput {
 export interface VerifyResult {
   available: boolean;
   totalPrice?: number;
+  pricePerKg?: number;
   tripId?: string;
+  boatId?: string;
   boatName?: string;
+  from?: string;
+  to?: string;
   message?: string;
 }
 
@@ -195,7 +199,8 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
   const params = [likeParam(i.depart), likeParam(i.arrivee), i.date];
 
   const { rows: allRows } = await db.query(
-    `SELECT t.id, t."pricePerKg" AS price_per_kg, b.name AS boat_name, b.capacity, ${USED_SQL} AS used
+    `SELECT t.id, t."pricePerKg" AS price_per_kg, t."boatId" AS boat_id, t."from" AS trip_from, t."to" AS trip_to,
+            b.name AS boat_name, b.capacity, ${USED_SQL} AS used
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
@@ -242,7 +247,11 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
   return {
     available: true,
     tripId: trip.id,
+    boatId: trip.boat_id ?? undefined,
     boatName: trip.boat_name ?? undefined,
+    from: trip.trip_from ?? undefined,
+    to: trip.trip_to ?? undefined,
+    pricePerKg: pricePerKg > 0 ? pricePerKg : undefined,
     totalPrice: needKg > 0 ? needKg * pricePerKg : undefined,
   };
 }
@@ -1044,6 +1053,224 @@ async function answerGeneral(question: string, places: string[]): Promise<string
 }
 
 /* =========================================================
+   Création d'une réservation (transaction + verrou sur le voyage)
+   Utilisée par POST /api/ai/reserve (front) et par la confirmation du chat.
+========================================================= */
+export interface ReserveInput {
+  depart: string;
+  arrivee: string;
+  date: string; // date du voyage, AAAA-MM-JJ
+  quantite: number;
+  poidsTotalKg: number;
+  marchandise?: string;
+  unite?: string;
+  clientName?: string;
+}
+
+// Utilisateur connecté (placé par requireAuth dans res.locals.sessionUser)
+export interface SessionUserLite {
+  id?: string;
+  name?: string;
+  lastName?: string;
+  email?: string;
+  tel?: string | null;
+}
+
+export interface ReservationSummary {
+  id: string;
+  clientName: string;
+  clientPhone: string;
+  clientEmail: string;
+  tripId: string;
+  boatId: string;
+  boatName: string;
+  departure: string;
+  destination: string;
+  date: string;
+  quantity: number;
+  unit: string;
+  cargoName: string;
+  unitWeightKg: number;
+  totalWeightKg: number;
+  unitPrice: number;
+  totalPrice: number;
+  status: 'EN_ATTENTE';
+}
+
+export type ReserveOutcome =
+  | { ok: true; id: string; price: number; reservation: ReservationSummary }
+  | { ok: false; message: string };
+
+export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): Promise<ReserveOutcome> {
+  const client = await pool.connect();
+  const tx = client as unknown as Db;
+  const qty = input.quantite;
+  const total = input.poidsTotalKg;
+
+  try {
+    await client.query('BEGIN');
+
+    // 1) premier contrôle, puis verrou sur le voyage pour éviter les doubles réservations
+    const first = await verifyTrip(
+      { depart: input.depart, arrivee: input.arrivee, date: input.date, poidsTotalKg: total, quantite: qty },
+      tx,
+    );
+    if (!first.available || !first.tripId) {
+      await client.query('ROLLBACK');
+      return { ok: false, message: first.message ?? 'Ce trajet n’est plus disponible.' };
+    }
+    await client.query('SELECT id FROM trips WHERE id = $1 FOR UPDATE', [first.tripId]);
+
+    // 2) revérification sous verrou : la capacité est recalculée à jour
+    const check = await verifyTrip(
+      {
+        depart: input.depart,
+        arrivee: input.arrivee,
+        date: input.date,
+        poidsTotalKg: total,
+        quantite: qty,
+        tripId: first.tripId,
+      },
+      tx,
+    );
+    if (!check.available || !check.tripId) {
+      await client.query('ROLLBACK');
+      return { ok: false, message: check.message ?? 'Ce trajet n’est plus disponible.' };
+    }
+
+    const price = check.totalPrice ?? 0;
+    const clientName =
+      input.clientName?.trim().slice(0, 100) ||
+      `${user?.name ?? ''} ${user?.lastName ?? ''}`.trim() ||
+      'Client IA';
+    const cols = await getReservationColumns(tx);
+
+    // Statut 'EN_ATTENTE' (contrainte chk_reservation_status). paymentStatus est un booléen : false = non payé.
+    const fields: Array<[string, unknown]> = [
+      ['clientName', clientName],
+      ['tripId', check.tripId],
+      ['quantity', qty],
+      ['weight', total],
+      ['totalPrice', price],
+      ['status', 'EN_ATTENTE'],
+    ];
+    if (cols.has('amountPaid')) fields.push(['amountPaid', 0]);
+    if (cols.has('amountToPay')) fields.push(['amountToPay', price]);
+    // La table reservations n'a pas de "createdAt" : la date est dans la colonne "date"
+    if (cols.has('date')) fields.push(['date', new Date().toISOString()]);
+    if (cols.has('paymentStatus')) fields.push(['paymentStatus', PAYMENT_STATUS_INIT]);
+    if (cols.has('userId') && user?.id) fields.push(['userId', user.id]);
+    if (cols.has('clientTel') && user?.tel) fields.push(['clientTel', user.tel]);
+
+    const names = fields.map(([n]) => `"${n}"`).join(', ');
+    const slots = fields.map((_f, idx) => `$${idx + 1}`).join(', ');
+    const insertRes = await client.query(
+      `INSERT INTO reservations (id, ${names})
+       VALUES (gen_random_uuid(), ${slots})
+       RETURNING id;`,
+      fields.map(([, v]) => v),
+    );
+    const reservationId = String(insertRes.rows[0].id);
+
+    // Ligne goods : elle alimente la colonne « Marchandise » des écrans de réservation
+    const itemName = (input.marchandise ?? 'Marchandise').replace(/^./, (c) => c.toUpperCase());
+    const unitWeight = Math.round((total / qty) * 100) / 100;
+    const unitPrice = Math.round((price / qty) * 100) / 100;
+    await client.query(
+      `INSERT INTO goods (id, "itemName", types, "embarkDate", quantity, "unitWeight", "totalWeight",
+                          "unitPrice", "totalPrice", "amountToPay", status, "reservationId", "userId", "tripId")
+       VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11, $12)`,
+      [
+        itemName,
+        input.unite ?? null,
+        input.date,
+        qty,
+        unitWeight,
+        total,
+        unitPrice,
+        price,
+        price,
+        reservationId,
+        user?.id ?? null,
+        check.tripId,
+      ],
+    );
+
+    await client.query('COMMIT');
+
+    return {
+      ok: true,
+      id: reservationId,
+      price,
+      reservation: {
+        id: reservationId,
+        clientName,
+        clientPhone: user?.tel ?? '',
+        clientEmail: user?.email ?? '',
+        tripId: check.tripId,
+        boatId: check.boatId ?? '',
+        boatName: check.boatName ?? '',
+        departure: check.from ?? input.depart,
+        destination: check.to ?? input.arrivee,
+        date: input.date,
+        quantity: qty,
+        unit: input.unite ?? '',
+        cargoName: itemName,
+        unitWeightKg: unitWeight,
+        totalWeightKg: total,
+        unitPrice,
+        totalPrice: price,
+        status: 'EN_ATTENTE',
+      },
+    };
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+function readReserveBody(body: any): { value: ReserveInput } | { error: string } {
+  const base = readVerifyBody(body);
+  if ('error' in base) return base;
+  const { depart, arrivee, date, poidsTotalKg, quantite } = base.value;
+  if (!poidsTotalKg || !quantite) return { error: 'poidsTotalKg et quantite sont requis' };
+
+  const text = (v: unknown, max: number) =>
+    typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
+
+  return {
+    value: {
+      depart,
+      arrivee,
+      date,
+      poidsTotalKg,
+      quantite,
+      marchandise: text(body?.marchandise, 80),
+      unite: text(body?.unite, 20),
+      clientName: text(body?.clientName, 100),
+    },
+  };
+}
+
+aiRouter.post('/reserve', aiRequestLimiter, async (req: Request, res: Response) => {
+  try {
+    const parsed = readReserveBody(req.body);
+    if ('error' in parsed) return res.status(400).json({ ok: false, message: parsed.error });
+
+    const sessionUser = res.locals.sessionUser as SessionUserLite | undefined;
+    const outcome = await reserveTrip(parsed.value, sessionUser);
+    if (!outcome.ok) return res.status(409).json({ ok: false, message: outcome.message });
+
+    return res.status(201).json({ ok: true, reservation: outcome.reservation });
+  } catch (error) {
+    console.error('Erreur /reserve:', error);
+    return res.status(500).json({ ok: false, message: 'Erreur lors de l’enregistrement de la réservation' });
+  }
+});
+
+/* =========================================================
    Route /chat (hybride : base de données + LLM + déterministe)
 ========================================================= */
 aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => {
@@ -1107,111 +1334,21 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
         );
       }
 
-      const clientName = String(req.body?.clientName ?? '').trim().slice(0, 100) || 'Client IA';
       // requireAuth place l'utilisateur connecté ici : il devient le propriétaire (userId) de la réservation
-      const sessionUser = res.locals.sessionUser as { id?: string } | undefined;
-      const client = await pool.connect();
-      const tx = client as unknown as Db;
-
-      type Outcome = { ok: true; id: string; price: number } | { ok: false; message: string };
-      let outcome: Outcome;
-      try {
-        await client.query('BEGIN');
-
-        // 1) premier contrôle, puis verrou sur le voyage pour éviter les doubles réservations
-        const first = await verifyTrip(
-          {
-            depart: draft.departure,
-            arrivee: draft.destination,
-            date: draft.dateExact,
-            poidsTotalKg: total,
-            quantite: draft.quantity || 1,
-          },
-          tx,
-        );
-        if (!first.available || !first.tripId) {
-          outcome = { ok: false, message: first.message ?? 'Ce trajet n’est plus disponible.' };
-        } else {
-          await client.query('SELECT id FROM trips WHERE id = $1 FOR UPDATE', [first.tripId]);
-
-          // 2) revérification sous verrou : la capacité est recalculée à jour
-          const check = await verifyTrip(
-            {
-              depart: draft.departure,
-              arrivee: draft.destination,
-              date: draft.dateExact,
-              poidsTotalKg: total,
-              quantite: draft.quantity || 1,
-              tripId: first.tripId,
-            },
-            tx,
-          );
-          if (!check.available || !check.tripId) {
-            outcome = { ok: false, message: check.message ?? 'Ce trajet n’est plus disponible.' };
-          } else {
-            const price = check.totalPrice ?? 0;
-            const cols = await getReservationColumns(tx);
-
-            // Statut 'EN_ATTENTE' (attendu par le front). Le paiement démarre à 0 Ar (Crédit).
-            const fields: Array<[string, unknown]> = [
-              ['clientName', clientName],
-              ['tripId', check.tripId],
-              ['quantity', draft.quantity || 1],
-              ['weight', total],
-              ['totalPrice', price],
-              ['status', 'EN_ATTENTE'],
-            ];
-            if (cols.has('amountPaid')) fields.push(['amountPaid', 0]);
-            if (cols.has('amountToPay')) fields.push(['amountToPay', price]);
-            // La table reservations n'a pas de "createdAt" : la date est dans la colonne "date"
-            if (cols.has('date')) fields.push(['date', new Date().toISOString()]);
-            if (cols.has('paymentStatus')) fields.push(['paymentStatus', PAYMENT_STATUS_INIT]);
-            if (cols.has('userId') && sessionUser?.id) fields.push(['userId', sessionUser.id]);
-
-            const names = fields.map(([n]) => `"${n}"`).join(', ');
-            const slots = fields.map((_f, idx) => `$${idx + 1}`).join(', ');
-            const insertRes = await client.query(
-              `INSERT INTO reservations (id, ${names})
-               VALUES (gen_random_uuid(), ${slots})
-               RETURNING id;`,
-              fields.map(([, v]) => v),
-            );
-
-            // Ligne goods : c'est elle qui alimente la colonne « Marchandise » du tableau des réservations
-            const reservationId = String(insertRes.rows[0].id);
-            const qty = draft.quantity || 1;
-            const itemName = (draft.cargoType ?? 'Marchandise').replace(/^./, (c) => c.toUpperCase());
-            await client.query(
-              `INSERT INTO goods (id, "itemName", types, "embarkDate", quantity, "unitWeight", "totalWeight",
-                                  "unitPrice", "totalPrice", "amountToPay", status, "reservationId", "userId", "tripId")
-               VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, $8, $9, FALSE, $10, $11, $12)`,
-              [
-                itemName,
-                draft.unit ?? null,
-                draft.dateExact,
-                qty,
-                Math.round((total / qty) * 100) / 100,
-                total,
-                Math.round((price / qty) * 100) / 100,
-                price,
-                price,
-                reservationId,
-                sessionUser?.id ?? null,
-                check.tripId,
-              ],
-            );
-
-            outcome = { ok: true, id: reservationId, price };
-          }
-        }
-
-        await client.query(outcome.ok ? 'COMMIT' : 'ROLLBACK');
-      } catch (txError) {
-        await client.query('ROLLBACK').catch(() => undefined);
-        throw txError;
-      } finally {
-        client.release();
-      }
+      const sessionUser = res.locals.sessionUser as SessionUserLite | undefined;
+      const outcome = await reserveTrip(
+        {
+          depart: draft.departure,
+          arrivee: draft.destination,
+          date: draft.dateExact,
+          quantite: draft.quantity || 1,
+          poidsTotalKg: total,
+          marchandise: draft.cargoType,
+          unite: draft.unit,
+          clientName: String(req.body?.clientName ?? ''),
+        },
+        sessionUser,
+      );
 
       if (!outcome.ok) {
         draft.awaitingConfirm = false;
