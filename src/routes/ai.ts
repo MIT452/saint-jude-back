@@ -6,7 +6,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-14-goods-icon';
+const BUILD = 'ai-2026-10-14-goods-icon-fallback';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -1649,7 +1649,10 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
 /* =========================================================
    Icône de marchandise : l'IA choisit UN emoji selon le nom,
    le résultat est mémorisé dans Neon (un nom = un seul appel à l'IA)
+   Les réponses de secours portent `fallback: true` : le front ne les mémorise pas.
 ========================================================= */
+
+const FALLBACK_ICON = '📦';
 
 // Limite à part (30/min par IP) : celle du chat (10/min) serait trop stricte pour les icônes
 const iconHits = new Map<string, number[]>();
@@ -1657,7 +1660,7 @@ function goodsIconLimiter(req: Request, res: Response, next: NextFunction) {
   const now = Date.now();
   const ip = req.ip ?? 'inconnu';
   const recent = (iconHits.get(ip) ?? []).filter((t) => now - t < 60_000);
-  if (recent.length >= 30) return res.status(429).json({ icon: '📦' });
+  if (recent.length >= 30) return res.status(429).json({ icon: FALLBACK_ICON, fallback: true });
   recent.push(now);
   iconHits.set(ip, recent);
   if (iconHits.size > 5000) {
@@ -1696,7 +1699,7 @@ Si tu ne comprends pas le mot, réponds : 📦`;
 
 aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Response) => {
   const name = String(req.body?.name ?? '').trim().slice(0, 80);
-  if (!name) return res.status(400).json({ icon: '📦' });
+  if (!name) return res.status(400).json({ icon: FALLBACK_ICON, fallback: true });
 
   const key = strip(name).replace(/\s+/g, ' ');
 
@@ -1706,7 +1709,8 @@ aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Respons
     // 1) Déjà choisi une fois par l'IA : aucun nouvel appel
     const cached = await defaultDb.query('SELECT icon_key FROM goods_icons WHERE name_key = $1', [key]);
     const cachedIcon = cached.rows[0] ? extractEmoji(String(cached.rows[0].icon_key)) : null;
-    if (cachedIcon) return res.json({ icon: cachedIcon });
+    // Un 📦 mémorisé par une ancienne version est ignoré : on redemande à l'IA
+    if (cachedIcon && cachedIcon !== FALLBACK_ICON) return res.json({ icon: cachedIcon });
 
     // 2) L'IA choisit l'emoji (même fournisseur que l'assistant : AI_PROVIDER / GROQ_API_KEY)
     const out = await getProvider().chat(
@@ -1717,7 +1721,8 @@ aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Respons
       { temperature: 0, maxTokens: 12, json: false },
     );
     const icon = extractEmoji(out);
-    if (!icon) return res.json({ icon: '📦' }); // réponse inutilisable : secours, non mémorisé
+    // réponse inutilisable : secours, non mémorisé
+    if (!icon) return res.json({ icon: FALLBACK_ICON, fallback: true });
 
     // 3) On mémorise
     await defaultDb.query(
@@ -1728,7 +1733,7 @@ aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Respons
     return res.json({ icon });
   } catch (err) {
     console.warn(`[IA] icône indisponible : ${safeError(err)}`);
-    return res.json({ icon: '📦' }); // jamais d'erreur côté client
+    return res.json({ icon: FALLBACK_ICON, fallback: true }); // jamais d'erreur côté client
   }
 });
 
