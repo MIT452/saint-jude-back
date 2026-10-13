@@ -6,7 +6,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-13-reserve';
+const BUILD = 'ai-2026-10-14-goods-icon';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -1643,6 +1643,92 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
   } catch (error) {
     console.error('Erreur IA / Neon:', error);
     return res.status(500).json({ error: 'Erreur lors du traitement de la demande' });
+  }
+});
+
+/* =========================================================
+   Icône de marchandise : l'IA choisit UN emoji selon le nom,
+   le résultat est mémorisé dans Neon (un nom = un seul appel à l'IA)
+========================================================= */
+
+// Limite à part (30/min par IP) : celle du chat (10/min) serait trop stricte pour les icônes
+const iconHits = new Map<string, number[]>();
+function goodsIconLimiter(req: Request, res: Response, next: NextFunction) {
+  const now = Date.now();
+  const ip = req.ip ?? 'inconnu';
+  const recent = (iconHits.get(ip) ?? []).filter((t) => now - t < 60_000);
+  if (recent.length >= 30) return res.status(429).json({ icon: '📦' });
+  recent.push(now);
+  iconHits.set(ip, recent);
+  if (iconHits.size > 5000) {
+    for (const [k, v] of iconHits) if (!v.some((t) => now - t < 60_000)) iconHits.delete(k);
+  }
+  next();
+}
+
+// La table est créée automatiquement au premier appel : rien à exécuter dans Neon
+let iconTableReady = false;
+async function ensureIconTable() {
+  if (iconTableReady) return;
+  await defaultDb.query(
+    `CREATE TABLE IF NOT EXISTS goods_icons (
+       name_key   TEXT PRIMARY KEY,
+       icon_key   TEXT NOT NULL,
+       source     TEXT NOT NULL DEFAULT 'ai',
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`,
+  );
+  iconTableReady = true;
+}
+
+// Premier emoji d'un texte (avec variantes), sinon null
+const EMOJI_RE = /\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u;
+const extractEmoji = (text: string): string | null => {
+  const m = text.match(EMOJI_RE);
+  return m ? m[0] : null;
+};
+
+const ICON_PROMPT = `Tu es un assistant pour une compagnie de transport maritime à Madagascar.
+On te donne le nom d'une marchandise (français ou malgache, éventuellement avec des fautes).
+Réponds par UN SEUL emoji qui représente le mieux cette marchandise, et rien d'autre : pas de texte, pas de ponctuation.
+Exemples : riz -> 🍚 ; montre -> ⌚ ; stylo -> 🖊️ ; zébu -> 🐄 ; moto -> 🏍️ ; ciment -> 🧱.
+Si tu ne comprends pas le mot, réponds : 📦`;
+
+aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Response) => {
+  const name = String(req.body?.name ?? '').trim().slice(0, 80);
+  if (!name) return res.status(400).json({ icon: '📦' });
+
+  const key = strip(name).replace(/\s+/g, ' ');
+
+  try {
+    await ensureIconTable();
+
+    // 1) Déjà choisi une fois par l'IA : aucun nouvel appel
+    const cached = await defaultDb.query('SELECT icon_key FROM goods_icons WHERE name_key = $1', [key]);
+    const cachedIcon = cached.rows[0] ? extractEmoji(String(cached.rows[0].icon_key)) : null;
+    if (cachedIcon) return res.json({ icon: cachedIcon });
+
+    // 2) L'IA choisit l'emoji (même fournisseur que l'assistant : AI_PROVIDER / GROQ_API_KEY)
+    const out = await getProvider().chat(
+      [
+        { role: 'system', content: ICON_PROMPT },
+        { role: 'user', content: name },
+      ],
+      { temperature: 0, maxTokens: 12, json: false },
+    );
+    const icon = extractEmoji(out);
+    if (!icon) return res.json({ icon: '📦' }); // réponse inutilisable : secours, non mémorisé
+
+    // 3) On mémorise
+    await defaultDb.query(
+      `INSERT INTO goods_icons (name_key, icon_key) VALUES ($1, $2)
+       ON CONFLICT (name_key) DO UPDATE SET icon_key = EXCLUDED.icon_key`,
+      [key, icon],
+    );
+    return res.json({ icon });
+  } catch (err) {
+    console.warn(`[IA] icône indisponible : ${safeError(err)}`);
+    return res.json({ icon: '📦' }); // jamais d'erreur côté client
   }
 });
 
