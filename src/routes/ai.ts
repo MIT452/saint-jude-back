@@ -1,6 +1,7 @@
 // src/routes/ai.ts
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { pool } from '../db.js';
+import { financeRouter } from './aiFinance.js';
 
 export const aiRouter = Router();
 
@@ -1740,5 +1741,11 @@ aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Respons
     return res.json({ icon: FALLBACK_ICON, fallback: true }); // jamais d'erreur côté client
   }
 });
+
+/* =========================================================
+   Assistant financier (caisse + carburant) : POST /api/ai/finance/chat
+   Monté ici pour hériter de l'authentification déjà appliquée à aiRouter.
+========================================================= */
+aiRouter.use('/finance', financeRouter);
 
 export default aiRouter;
