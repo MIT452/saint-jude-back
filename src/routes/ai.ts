@@ -2,12 +2,14 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { pool } from '../db.js';
 import { financeRouter } from './aiFinance.js';
+import { SYSTEM_PROMPT, GENERAL_PROMPT } from '../ai/prompts.js';
+import { humanize } from '../ai/humanize.js';
 
 export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-14-goods-icon-gptoss';
+const BUILD = 'ai-2026-10-16-humanize-prompts';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -48,7 +50,7 @@ const MONTH_NAMES = [
 ];
 
 const strip = (s: string) =>
-  s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+  s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 
 const todayLocal = () =>
   new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date()); // YYYY-MM-DD
@@ -990,6 +992,7 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
       latencyMs: Date.now() - started,
       sample: out.trim().slice(0, 20),
       keys,
+      humanize: process.env.AI_HUMANIZE === '1',
     });
   } catch (error) {
     return res.status(503).json({
@@ -1000,41 +1003,12 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
       latencyMs: Date.now() - started,
       error: safeError(error),
       keys,
+      humanize: process.env.AI_HUMANIZE === '1',
     });
   }
 });
 
-const SYSTEM_PROMPT = `Tu es l'assistant de réservation de Saint-Jude (transport maritime Madagascar).
-Tu extrais UNIQUEMENT les informations fournies par le client. Tu n'inventes JAMAIS de prix, de disponibilité ou de date.
-
-Réponds UNIQUEMENT en JSON strict :
-{
-  "cargoType": string | null,
-  "unit": string | null,
-  "quantity": number | null,
-  "weightKg": number | null,
-  "weightMode": "unit" | "total" | null,
-  "departure": string | null,
-  "destination": string | null,
-  "dateText": string | null,
-  "confidence": number
-}
-
-Règles strictes :
-- Ne jamais inventer une valeur absente.
-- Une salutation (« bonjour », « salut », « merci »…) n'est JAMAIS une marchandise : mets tout à null.
-- cargoType = uniquement un produit réel (riz, sacs de ciment, meubles…), jamais « transport » ni « marchandise ».
-- Si le client dit seulement un nom de port, place-le selon le contexte (departure ou destination).
-- Si le client répond seulement par un nombre, place-le selon la question en cours (quantity ou weightKg).
-- Les ports connus sont fournis dynamiquement.
-- dateText = texte brut dit par le client ("demain", "vendredi prochain", "15 octobre"...).
-`;
-
-const GENERAL_PROMPT = `Tu es l'assistant de Saint-Jude, entreprise de transport maritime (passagers et marchandises) à Madagascar.
-Réponds en français, en 1 à 3 phrases courtes, de façon claire et utile.
-Tu n'as accès à AUCUNE donnée en temps réel : n'invente jamais de prix, d'horaire, de disponibilité, de numéro de réservation ni de chiffre. Pour ces informations, invite le client à préciser le trajet, la date et la marchandise afin que le système les vérifie, ou à poser une question sur les voyages, les tarifs ou les bateaux.
-Si la question n'a aucun rapport avec le transport maritime ou Saint-Jude, dis poliment que tu ne peux aider que pour les réservations et le transport.
-N'utilise pas de JSON.`;
+// SYSTEM_PROMPT et GENERAL_PROMPT sont importés depuis src/ai/prompts.ts
 
 async function answerGeneral(question: string, places: string[]): Promise<string | null> {
   try {
@@ -1305,8 +1279,23 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     const places = await getKnownPlaces();
     let quoteSummary: Record<string, unknown> | null = null;
 
-    const send = (reply: string, extra: Record<string, unknown> = {}) =>
-      res.json({ reply, reponse: reply, updatedContext: draft, quoteSummary, ...extra });
+    // Envoi de la réponse. Les messages à gabarit fixe sont reformulés par le LLM
+    // (garde-fous dans humanize : nombres, ports et question/affirmation inchangés).
+    // Jamais reformulés : la confirmation de réservation et les réponses déjà générées par le LLM.
+    const send = async (reply: string, extra: Record<string, unknown> = {}) => {
+      const { skipHumanize, ...payload } = extra;
+      const finalReply =
+        payload.reservationCreated || skipHumanize
+          ? reply
+          : await humanize(reply, places, (m, o) => getProvider().chat(m, o));
+      return res.json({
+        reply: finalReply,
+        reponse: finalReply,
+        updatedContext: draft,
+        quoteSummary,
+        ...payload,
+      });
+    };
 
     // ---- A. Annuler / recommencer
     if (isRestartIntent(question)) {
@@ -1580,7 +1569,8 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       const answer =
         (await answerGeneral(question, places)) ??
         'Je n’ai pas bien compris votre question. Je peux préparer une réservation, consulter les voyages, les tarifs ou les bateaux.';
-      return send(withReminder(answer, draft));
+      // déjà rédigée par le LLM : pas de seconde reformulation
+      return send(withReminder(answer, draft), { skipHumanize: true });
     }
 
     // Corrections signalées
@@ -1690,7 +1680,7 @@ async function ensureIconTable() {
 }
 
 // Premier emoji d'un texte (avec variantes), sinon null
-const EMOJI_RE = /\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u;
+const EMOJI_RE = /\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u;
 const extractEmoji = (text: string): string | null => {
   const m = text.match(EMOJI_RE);
   return m ? m[0] : null;
