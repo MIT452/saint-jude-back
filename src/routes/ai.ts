@@ -9,7 +9,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-16-humanize-prompts';
+const BUILD = 'ai-2026-10-16-malagasy-intents';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -110,8 +110,8 @@ export function parseRelativeDate(
 
   if (!target) {
     if (/apres[- ]demain/.test(t)) target = addDays(today, 2);
-    else if (/\bdemain\b/.test(t)) target = addDays(today, 1);
-    else if (/aujourd/.test(t)) target = today;
+    else if (/\b(demain|rahampitso)\b/.test(t)) target = addDays(today, 1);
+    else if (/aujourd|\bandroany\b/.test(t)) target = today;
   }
 
   if (!target) {
@@ -517,10 +517,11 @@ function found1(places: string[], loneNorm: string): string | undefined {
   );
 }
 
+// Français + malgache (eny = oui, tsia = non). Ajoute ici d'autres mots si tes clients en utilisent.
 const isYes = (t: string) =>
-  /^(oui|ok|d'accord|confirme|confirmer|valide|valider)\b/.test(strip(t));
+  /^(oui|ok|d'accord|confirme|confirmer|valide|valider|eny)\b/.test(strip(t));
 const isNo = (t: string) =>
-  /^(non|no|nope|modifier|changer|corriger)\b/.test(strip(t));
+  /^(non|no|nope|modifier|changer|corriger|tsia)\b/.test(strip(t));
 const isCancelIntent = (t: string) =>
   /^(annule|annuler|stop|laisse tomber|abandonne|abandonner|abandon)\b/.test(strip(t));
 const isRestartIntent = (t: string) =>
@@ -528,13 +529,17 @@ const isRestartIntent = (t: string) =>
 
 /** Salutation seule (« bonjour », « bonjours », « salut ! »…) : ce n'est PAS une réponse à la question. */
 const isPureGreeting = (t: string) =>
-  /^(bonjour|bonjours|bonsoir|salut|coucou|hello|hi|allo|salam)(\s+(a tous|tout le monde|madame|monsieur))?[\s!?.,;]*$/.test(
+  /^(bonjour|bonjours|bonsoir|salut|coucou|hello|hi|allo|salam|salama|manao ahoana)(\s+(a tous|tout le monde|madame|monsieur|tompoko))?[\s!?.,;]*$/.test(
     strip(t),
   );
 
+/** Remerciement seul (français ou malgache). */
+const isThanks = (t: string) =>
+  /^(merci|merci beaucoup|ok merci|misaotra|misaotra betsaka)[\s!?.,;]*$/.test(strip(t));
+
 /** Bavardage (« tu vas bien ? », « ça va », « merci »…) : pas une réponse à la question en cours. */
 const isSmallTalk = (t: string) =>
-  /^(tu vas bien|vous allez bien|ca va|ca va bien|comment (ca va|vas[- ]tu|tu vas|allez[- ]vous|vous allez)|merci|merci beaucoup|ok merci|super|cool)[\s!?.,;]*$/.test(
+  /^(tu vas bien|vous allez bien|ca va|ca va bien|comment (ca va|vas[- ]tu|tu vas|allez[- ]vous|vous allez)|merci|merci beaucoup|ok merci|super|cool|misaotra|misaotra betsaka|manao ahoana ianao|ahoana ianao|salama tsara)[\s!?.,;]*$/.test(
     strip(t),
   );
 
@@ -1382,7 +1387,11 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       const q0 = nextQuestion(draft);
       if (q0) draft.asked = q0.field;
       const rest = q0 ? q0.text.replace(/^(D’accord|Très bien)[^!.]*[!.]\s*/, '') : '';
-      const hello = isSmallTalk(question) ? 'Je vais bien, merci !' : 'Bonjour !';
+      const hello = isThanks(question)
+        ? 'Avec plaisir !'
+        : isSmallTalk(question)
+          ? 'Je vais bien, merci !'
+          : 'Bonjour !';
       return send(
         rest
           ? `${hello} Je vous aide à préparer votre réservation. ${rest}`
