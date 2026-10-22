@@ -29,8 +29,10 @@ function define(
 }
 
 define('lister_bateaux', 'Liste les bateaux, filtrables par état', { etat: { type: 'string' } }, [], async (a) => {
+  // Comparaison insensible à la casse et aux espaces : « disponible » = « Disponible »
   const { rows } = await pool.query(
-    `SELECT id, name, capacity, state FROM boats WHERE ($1::text IS NULL OR state = $1) LIMIT 50`,
+    `SELECT id, name, capacity, state FROM boats
+     WHERE ($1::text IS NULL OR LOWER(TRIM(state)) = LOWER(TRIM($1))) LIMIT 50`,
     [str(a.etat)]
   );
   return rows;
