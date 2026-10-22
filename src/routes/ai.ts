@@ -1293,7 +1293,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       const finalReply =
         payload.reservationCreated || skipHumanize
           ? reply
-          : await humanize(reply, places, (m, o) => getProvider().chat(m, o));
+          : await humanize(reply, places, (m, o) => getProvider().chat(m, o), question);
       return res.json({
         reply: finalReply,
         reponse: finalReply,
