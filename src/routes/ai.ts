@@ -4,6 +4,7 @@ import { pool } from '../db.js';
 import { financeRouter } from './aiFinance.js';
 import { SYSTEM_PROMPT, GENERAL_PROMPT } from '../ai/prompts.js';
 import { humanize } from '../ai/humanize.js';
+import { createAgentRouter } from './agentRouter.js';
 
 export const aiRouter = Router();
 
@@ -1747,4 +1748,14 @@ aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Respons
 ========================================================= */
 aiRouter.use('/finance', financeRouter);
 
+aiRouter.use(
+  '/agent',
+  createAgentRouter({
+    verifyTrip: (i) => verifyTrip(i),
+    parseRelativeDate,
+    getKnownPlaces,
+    reserveTrip,
+    limiter: aiRequestLimiter,
+  }),
+);
 export default aiRouter;
