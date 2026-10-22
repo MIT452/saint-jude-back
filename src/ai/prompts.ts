@@ -46,9 +46,10 @@ LANGUE : réponds TOUJOURS dans la langue du dernier message du client (françai
 STYLE : 1 à 3 phrases courtes, directes, chaleureuses. Pose UNE seule question à la fois, sans la répéter. Pas de formule de fin du type « Je reste à votre disposition ». Pas de liste. Ne répète jamais une réponse déjà donnée : reformule. Mets toujours une espace après . ? ! et entre deux phrases.
 SALUTATION : si le client salue, salue-le simplement et demande ce qu'il souhaite transporter. N'écris jamais « à nouveau » ni « encore ».
 RÈGLES :
-- Tu n'as accès à AUCUNE donnée en temps réel : n'invente jamais de prix, d'horaire, de disponibilité, de numéro de réservation ni de chiffre.
-- Ne cite JAMAIS de port, de ville ou de bateau en exemple : seul le système connaît les ports et trajets réels. Pour savoir où partir ou arriver, demande simplement au client de l'indiquer.
-- Pour les prix, horaires et disponibilités, invite le client à préciser le trajet, la date et la marchandise afin que le système les vérifie, ou à poser une question sur les voyages, les tarifs ou les bateaux.
+- Tu es comme un vendeur qui lit son catalogue : tu ne connais AUCUN prix, horaire, disponibilité, port, bateau, date ni numéro de réservation. Ces informations viennent uniquement de la base de données, via le système.
+- N'invente jamais de chiffre. Ne cite JAMAIS de port, de ville ou de bateau, même en exemple. Pas de « par exemple », pas de « ohatra », pas de parenthèse d'exemples.
+- Pour un prix, un horaire ou une disponibilité, demande simplement au client la marchandise, le poids, le port de départ, le port d'arrivée et la date : le système les vérifie.
+- N'écris jamais de texte technique, de code, de commentaire interne ni de mots anglais (comme « await » ou « waiting »). Ta réponse est lue telle quelle par le client.
 - Ne confirme jamais une réservation toi-même.
 - Si la question n'a aucun rapport avec le transport maritime ou Saint-Jude, dis-le poliment et brièvement, puis propose ton aide pour un transport.
 - Si tu ne sais pas, dis-le clairement.
@@ -97,11 +98,15 @@ export function humanizeInput(messageToRewrite: string, clientText: string): str
   return `Langue du client : ${LANG_LABEL[lang]}\nMessage à reformuler : ${messageToRewrite}`;
 }
 
-/** Filet de sécurité : ajoute l'espace manquante après . ? ! (ex. "?Veuillez" → "? Veuillez"). */
+/**
+ * Filet de sécurité : ajoute l'espace manquante après . ? ! (ex. "?Veuillez" → "? Veuillez").
+ * Les retours à la ligne sont conservés (listes de bateaux, rappels).
+ */
 export function cleanReply(text: string): string {
   return text
     .replace(/([.!?])(?=[A-ZÀ-ÝÉÈÊ])/g, "$1 ")
-    .replace(/\s{2,}/g, " ")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
@@ -116,4 +121,72 @@ export function joinParts(...parts: Array<string | null | undefined>): string {
     out.push(t);
   }
   return cleanReply(out.join(" "));
+}
+
+/**
+ * Nettoie une réponse générée par le LLM : texte interne, exemples inventés, ponctuation doublée.
+ * À appliquer à TOUTES les réponses envoyées au client.
+ */
+export function sanitizeLLMReply(text: string): string {
+  let t = text;
+
+  // Fuites internes (ex. « await date.(Waiting for user response) »)
+  t = t.replace(/\(?\s*waiting for user[^)\n]*\)?/gi, "");
+  t = t.replace(/\bawait\s+[\w.]+\.?/gi, "");
+
+  // Parenthèses d'exemples : (ohatra: ...), (par exemple ...), (ex. ...), (e.g. ...)
+  t = t.replace(/\(\s*(ohatra|par exemple|ex\.?|e\.g\.?|for example)[^)]*\)/gi, "");
+
+  // Ponctuation doublée ou orpheline (sans toucher aux retours à la ligne)
+  t = t.replace(/[ \t]*\.{3,}[ \t]*/g, " ").replace(/([?!.])[ \t]*[?!.]+/g, "$1");
+
+  return cleanReply(t);
+}
+
+/* ------------------------------------------------------------------ */
+/*  5. Date du jour : toujours calculée par le serveur                  */
+/* ------------------------------------------------------------------ */
+
+const MG_DAYS = ["Alahady", "Alatsinainy", "Talata", "Alarobia", "Alakamisy", "Zoma", "Asabotsy"];
+const MG_MONTHS = ["Janoary", "Febroary", "Martsa", "Aprily", "May", "Jona",
+                   "Jolay", "Aogositra", "Septambra", "Oktobra", "Novambra", "Desambra"];
+const FR_DAYS = ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"];
+const FR_MONTHS = ["janvier", "février", "mars", "avril", "mai", "juin",
+                   "juillet", "août", "septembre", "octobre", "novembre", "décembre"];
+
+// Le message entier doit être une question de date (pas « quelle est la date de départ du voyage ? »)
+const DATE_QUESTION =
+  /^(firy ny date( anio| androany)?|andro inona( androany| izao)?|daty anio|quelle est la date( d'aujourd'hui)?|on est le combien|what('s| is) (the )?date( today)?)[\s?!.]*$/;
+
+/** Répond à « quelle est la date ? » depuis l'horloge du serveur (Madagascar). Sinon null. */
+export function dateReply(question: string, now = new Date()): string | null {
+  const q = question
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/’/g, "'")
+    .toLowerCase()
+    .trim();
+  if (!DATE_QUESTION.test(q)) return null;
+
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Indian/Antananarivo",
+    weekday: "short",
+    day: "numeric",
+    month: "numeric",
+    year: "numeric",
+  }).formatToParts(now);
+  const get = (type: string) => parts.find((p) => p.type === type)!.value;
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(get("weekday"));
+  const day = Number(get("day"));
+  const month = Number(get("month")) - 1;
+  const year = get("year");
+
+  switch (detectLang(question)) {
+    case "mg":
+      return `Androany dia ${MG_DAYS[dow]} ${day} ${MG_MONTHS[month]} ${year}.`;
+    case "en":
+      return `Today is ${now.toLocaleDateString("en-GB", { timeZone: "Indian/Antananarivo", dateStyle: "full" })}.`;
+    default:
+      return `Nous sommes ${FR_DAYS[dow]} ${day} ${FR_MONTHS[month]} ${year}.`;
+  }
 }

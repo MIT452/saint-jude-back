@@ -2,7 +2,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { pool } from '../db.js';
 import { financeRouter } from './aiFinance.js';
-import { SYSTEM_PROMPT, GENERAL_PROMPT } from '../ai/prompts.js';
+import { SYSTEM_PROMPT, GENERAL_PROMPT, sanitizeLLMReply, dateReply } from '../ai/prompts.js';
 import { humanize } from '../ai/humanize.js';
 import { createAgentRouter } from './agentRouter.js';
 
@@ -50,8 +50,9 @@ const MONTH_NAMES = [
   'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre',
 ];
 
+// \u0300-\u036f = accents combinants
 const strip = (s: string) =>
-  s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
+  s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
 
 const todayLocal = () =>
   new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(new Date()); // YYYY-MM-DD
@@ -1016,15 +1017,13 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
 
 // SYSTEM_PROMPT et GENERAL_PROMPT sont importés depuis src/ai/prompts.ts
 
-async function answerGeneral(question: string, places: string[]): Promise<string | null> {
+// Le modèle ne reçoit AUCUN nom de port : seul le système (la base) connaît les ports et trajets.
+async function answerGeneral(question: string, _places: string[]): Promise<string | null> {
   try {
     const provider = getProvider();
     const out = await provider.chat(
       [
-        {
-          role: 'system',
-          content: `${GENERAL_PROMPT}\nDate du jour : ${todayLocal()}. Ports connus : ${places.join(', ') || 'aucun'}.`,
-        },
+        { role: 'system', content: GENERAL_PROMPT },
         { role: 'user', content: question },
       ],
       { temperature: 0.3, maxTokens: 300, json: false },
@@ -1288,20 +1287,26 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
     // Envoi de la réponse. Les messages à gabarit fixe sont reformulés par le LLM
     // (garde-fous dans humanize : nombres, ports et question/affirmation inchangés).
     // Jamais reformulés : la confirmation de réservation et les réponses déjà générées par le LLM.
+    // TOUTES les réponses passent ensuite par sanitizeLLMReply (fuites internes, exemples inventés).
     const send = async (reply: string, extra: Record<string, unknown> = {}) => {
       const { skipHumanize, ...payload } = extra;
       const finalReply =
         payload.reservationCreated || skipHumanize
           ? reply
           : await humanize(reply, places, (m, o) => getProvider().chat(m, o), question);
+      const safeReply = sanitizeLLMReply(finalReply) || reply;
       return res.json({
-        reply: finalReply,
-        reponse: finalReply,
+        reply: safeReply,
+        reponse: safeReply,
         updatedContext: draft,
         quoteSummary,
         ...payload,
       });
     };
+
+    // ---- A0. Date du jour : calculée par le serveur, jamais par le modèle
+    const dateAnswer = dateReply(question);
+    if (dateAnswer) return send(withReminder(dateAnswer, draft), { skipHumanize: true });
 
     // ---- A. Annuler / recommencer
     if (isRestartIntent(question)) {
@@ -1576,6 +1581,16 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
 
     // ---- G. Aucune information utile et c'est une question → réponse pertinente, sans inventer
     if (!draftChanged && looksLikeQuestion(question)) {
+      // Prix / horaires / disponibilités : seule la base fait foi, le modèle ne répond pas
+      if (/\b(prix|tarifs?|combien|cout|coute|horaires?|dispon\w*|ohatrinona|vidiny)\b/.test(qn)) {
+        return send(
+          withReminder(
+            'Pour vous donner un prix ou une disponibilité exacts, j’ai besoin de la marchandise, du poids, du port de départ, du port d’arrivée et de la date.',
+            draft,
+          ),
+          { skipHumanize: true },
+        );
+      }
       const answer =
         (await answerGeneral(question, places)) ??
         'Je n’ai pas bien compris votre question. Je peux préparer une réservation, consulter les voyages, les tarifs ou les bateaux.';
@@ -1600,9 +1615,14 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       const misunderstood = !draftChanged && !!draft.asked;
       draft.asked = q.field;
       draft.awaitingConfirm = false;
+      // Ports réels lus dans la base (comme un rayon d'épicerie : le client choisit dans la liste)
+      const portsHint =
+        (q.field === 'departure' || q.field === 'destination') && places.length
+          ? ` Ports disponibles : ${[...places].sort((a, b) => a.localeCompare(b)).slice(0, 8).join(', ')}.`
+          : '';
       const body = misunderstood
-        ? `Je n’ai pas bien compris votre réponse. ${q.text.replace(/^(?:D’accord[^!]*!|Très bien\.)\s*/, '')}`
-        : `${prefix}${q.text}`;
+        ? `Je n’ai pas bien compris votre réponse. ${q.text.replace(/^(?:D’accord[^!]*!|Très bien\.)\s*/, '')}${portsHint}`
+        : `${prefix}${q.text}${portsHint}`;
       return send(body);
     }
 
@@ -1689,8 +1709,8 @@ async function ensureIconTable() {
   iconTableReady = true;
 }
 
-// Premier emoji d'un texte (avec variantes), sinon null
-const EMOJI_RE = /\p{Extended_Pictographic}(?:️|‍\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u;
+// Premier emoji d'un texte (avec variantes : \uFE0F = sélecteur de variante, \u200D = liant), sinon null
+const EMOJI_RE = /\p{Extended_Pictographic}(?:\uFE0F|\u200D\p{Extended_Pictographic}|\p{Emoji_Modifier})*/u;
 const extractEmoji = (text: string): string | null => {
   const m = text.match(EMOJI_RE);
   return m ? m[0] : null;
