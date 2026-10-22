@@ -39,10 +39,14 @@ const todayLong = () =>
     year: 'numeric',
   }).format(new Date());
 
-function buildSystemPrompt(ctx: Ctx, places: string[], documents: string): string {
+function buildSystemPrompt(ctx: Ctx, places: string[], documents: string, boatsData = ''): string {
   const p = ctx.conv.pending;
   const pendingText = p
     ? `\nRÉSERVATION EN ATTENTE DE CONFIRMATION (déjà préparée) : ${p.quantite} ${p.unite ?? 'unité(s)'} de ${p.marchandise}, ${p.poidsTotalKg} kg, ${p.depart} → ${p.arrivee}, le ${p.date}${p.prix ? `, ${p.prix} Ar` : ''}. Le client doit cliquer sur « Confirmer ». Si le client change un élément, appelle de nouveau preparer_reservation.`
+    : '';
+
+  const boatsText = boatsData
+    ? `DONNÉES BATEAUX (lues dans la base, seule source de vérité) :\n${boatsData}\nPour toute question sur les bateaux, réponds uniquement avec ces données. Un bateau est disponible seulement si son état est « Disponible » ; « En maintenance » et « Hors service » ne le sont pas. Ne dis « aucun bateau » que si cette liste est vide.\n\n`
     : '';
 
   return `Tu es l'assistant de Saint-Jude, entreprise de transport maritime à Madagascar. Tu aides les clients à consulter les voyages, les tarifs et les bateaux, et à préparer des réservations de marchandises.
@@ -64,14 +68,15 @@ CONVERSATION
 - Tu peux répondre normalement aux salutations et à la conversation courante, puis ramener la discussion vers le transport.
 
 RÈGLES STRICTES
-- Aucun prix, horaire, disponibilité, nombre de places ou nom de bateau sans avoir appelé l'outil correspondant. N'invente jamais un chiffre.
+- Aucun prix, horaire, disponibilité, nombre de places ou nom de bateau sans avoir appelé l'outil correspondant (ou sans l'avoir lu dans les DONNÉES BATEAUX ci-dessous). N'invente jamais un chiffre.
+- Pour lister_bateaux, n'utilise PAS le paramètre etat : appelle l'outil sans argument, puis lis l'état de chaque bateau dans le résultat.
 - Avant de proposer une réservation, vérifie le trajet avec verifier_trajet ou preparer_reservation.
 - Tu ne peux PAS enregistrer une réservation. preparer_reservation crée seulement un récapitulatif ; le client doit cliquer sur le bouton « Confirmer ». Ne dis JAMAIS qu'une réservation est enregistrée, et ne prétends jamais l'avoir annulée.
 - Tu ne gères que le transport de marchandises. Pour un billet passager, explique poliment que ce n'est pas encore possible par le chat.
 - Si un outil renvoie une erreur ou aucun résultat, dis-le honnêtement et propose une alternative (autre date, autre trajet).
 - Si la question n'a aucun rapport avec le transport maritime, dis-le poliment et brièvement.${pendingText}
 
-Contexte documentaire (à utiliser seulement s'il est pertinent) :
+${boatsText}Contexte documentaire (à utiliser seulement s'il est pertinent) :
 ${documents || 'Aucun document pertinent.'}`;
 }
 
@@ -252,11 +257,27 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
       Object.entries(tools).map(([name, tool]) => ({ name, description: tool.def.function.description })),
     ).map((t) => t.name),
   );
+
+  // Question sur les bateaux : l'outil est toujours proposé ET la base est lue directement par le code
+  const BOAT_RE = /\b(bateaux?|batos?|navires?|sambo)\b/i;
+  const askedBoats = BOAT_RE.test(input.message);
+  if (askedBoats && tools['lister_bateaux']) relevant.add('lister_bateaux');
+
+  let boatsData = '';
+  if (askedBoats && tools['lister_bateaux']) {
+    try {
+      // sans filtre : on lit TOUS les bateaux avec leur état réel
+      boatsData = JSON.stringify(await tools['lister_bateaux'].run({})).slice(0, 3000);
+    } catch (e) {
+      console.error('[agent] lecture bateaux :', safeError(e));
+    }
+  }
+
   const availableTools = [...toolDefs.filter((d) => relevant.has(d.function.name)), ...reservationToolDefs];
 
   // Les échanges d'outils vivent seulement dans ce tour ; l'historique stocké reste du texte propre.
   const turn: Msg[] = [
-    { role: 'system', content: buildSystemPrompt(ctx, places, docText) },
+    { role: 'system', content: buildSystemPrompt(ctx, places, docText, boatsData) },
     ...trim(conv.messages, MAX_HISTORY),
   ];
 
