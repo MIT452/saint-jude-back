@@ -1,4 +1,4 @@
-export type AgentRole = 'planner' | 'specialist';
+﻿export type AgentRole = 'planner' | 'specialist';
 
 export type OrchestrationInput = {
   question: string;
@@ -12,12 +12,12 @@ export type OrchestrationResult = {
 };
 
 export async function runMultiAgent(question: string): Promise<OrchestrationResult> {
-  const { runAgent } = await import('./agent.js');
+  const { runOneShotAgent } = await import('./agent.js');
   const [planning, specialist] = await Promise.all([
-    runAgent(`Tu es l'agent planificateur. Décompose cette demande en étapes et précise les informations manquantes : ${question}`),
-    runAgent(`Tu es l'agent spécialiste transport maritime Saint-Jude. Identifie les contraintes métier et les vérifications nécessaires : ${question}`),
+    runOneShotAgent(`Tu es l'agent planificateur. Décompose cette demande en étapes et précise les informations manquantes : ${question}`),
+    runOneShotAgent(`Tu es l'agent spécialiste transport maritime Saint-Jude. Identifie les contraintes métier et les vérifications nécessaires : ${question}`),
   ]);
-  const answer = await runAgent(`Synthétise ces analyses en une réponse courte sans inventer de données. Demande: ${question}\nPlan: ${planning}\nAnalyse spécialiste: ${specialist}`);
+  const answer = await runOneShotAgent(`Synthétise ces analyses en une réponse courte sans inventer de données. Demande: ${question}\nPlan: ${planning}\nAnalyse spécialiste: ${specialist}`);
   return {
     status: 'completed',
     agents: [

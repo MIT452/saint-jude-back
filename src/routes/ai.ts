@@ -4,12 +4,13 @@ import { pool } from '../db.js';
 import { financeRouter } from './aiFinance.js';
 import { SYSTEM_PROMPT, GENERAL_PROMPT } from '../ai/prompts.js';
 import { humanize } from '../ai/humanize.js';
+import { createAgentRouter } from './agentRouter.js';
 
 export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-16-malagasy-intents';
+const BUILD = 'ai-2026-10-22-agent';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -1747,4 +1748,14 @@ aiRouter.post('/goods-icon', goodsIconLimiter, async (req: Request, res: Respons
 ========================================================= */
 aiRouter.use('/finance', financeRouter);
 
+aiRouter.use(
+  '/agent',
+  createAgentRouter({
+    verifyTrip: (i) => verifyTrip(i),
+    parseRelativeDate,
+    getKnownPlaces,
+    reserveTrip,
+    limiter: aiRequestLimiter,
+  }),
+);
 export default aiRouter;
