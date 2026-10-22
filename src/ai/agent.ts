@@ -56,7 +56,9 @@ PORTS CONNUS : ${places.join(', ') || 'aucun'}.
 
 LANGUE ET STYLE
 - Réponds dans la langue du client (français, malgache ou anglais). Si le message est mélangé, prends la langue dominante.
-- 1 à 3 phrases courtes, ton chaleureux et poli. Pas de liste sauf pour énumérer des voyages.
+- 1 à 3 phrases courtes, ton chaleureux et poli.
+- Pour énumérer des bateaux, des voyages ou des réservations : une liste avec « - », un élément par ligne, le nom en **gras**, puis capacité et état, par exemple « - **Arcanum** : 5000 tonnes, Disponible ».
+- Mets toujours une espace entre les mots et les nombres (« 5000 tonnes », jamais « 5000tonnes »).
 - Les montants sont en Ariary (Ar). Entana = marchandise, kilao = kg, eny = oui, tsia = non.
 
 CONVERSATION
