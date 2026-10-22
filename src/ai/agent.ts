@@ -241,6 +241,38 @@ export interface AgentOutput {
   pending: ReturnType<typeof publicPending>;
 }
 
+/* =========================================================
+   Réponse « bateaux » calculée par le code (le modèle ne peut pas se tromper)
+========================================================= */
+const norm = (s: string) =>
+  s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+
+type BoatRow = { name?: unknown; capacity?: unknown; state?: unknown };
+
+const boatLine = (b: BoatRow) => `- **${String(b.name ?? 'Bateau')}** : ${String(b.capacity ?? '?')} tonnes, ${String(b.state ?? 'état inconnu')}`;
+
+function boatsReply(rows: BoatRow[], message: string): string {
+  if (!rows.length) return "Aucun bateau n'est enregistré pour le moment.";
+  const wantsAvailable = /dispo/.test(norm(message));
+  if (!wantsAvailable) return `Voici nos bateaux (${rows.length}) :\n${rows.map(boatLine).join('\n')}`;
+
+  const free = rows.filter((b) => norm(String(b.state ?? '')) === 'disponible');
+  const others = rows.filter((b) => norm(String(b.state ?? '')) !== 'disponible');
+  if (!free.length) {
+    return `Aucun bateau n'est disponible actuellement. Voici l'état de la flotte :\n${rows.map(boatLine).join('\n')}`;
+  }
+  const head = free.length === 1 ? 'Un bateau est disponible :' : `${free.length} bateaux sont disponibles :`;
+  const tail = others.length ? `\n\nLes autres bateaux ne sont pas disponibles :\n${others.map(boatLine).join('\n')}` : '';
+  return `${head}\n${free.map(boatLine).join('\n')}${tail}`;
+}
+
+// Questions sur les bateaux qui ne concernent PAS une réservation : on répond sans passer par le modèle
+const BOOKING_WORDS = /(reserv|expedi|envoy|prix|tarif|trajet|voyage|date|demain|kilo|\bkg\b|\bsacs?\b|colis|port)/;
+
 export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<AgentOutput> {
   const conv = await loadConv(input.conversationId, input.userId);
   const ctx: Ctx = { conv, deps };
@@ -266,13 +298,25 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
   if (askedBoats && tools['lister_bateaux']) relevant.add('lister_bateaux');
 
   let boatsData = '';
+  let boatRows: BoatRow[] | null = null;
   if (askedBoats && tools['lister_bateaux']) {
     try {
       // sans filtre : on lit TOUS les bateaux avec leur état réel
-      boatsData = JSON.stringify(await tools['lister_bateaux'].run({})).slice(0, 3000);
+      const raw = await tools['lister_bateaux'].run({});
+      if (Array.isArray(raw)) boatRows = raw as BoatRow[];
+      boatsData = JSON.stringify(raw).slice(0, 3000);
     } catch (e) {
       console.error('[agent] lecture bateaux :', safeError(e));
     }
+  }
+
+  // Réponse directe : liste/disponibilité des bateaux, sans réservation en cours
+  if (boatRows && !conv.pending && !BOOKING_WORDS.test(norm(input.message))) {
+    const direct = boatsReply(boatRows, input.message);
+    conv.messages.push({ role: 'assistant', content: direct });
+    await saveConv(conv);
+    console.log(JSON.stringify({ ai: 'direct', conv: conv.id, boats: boatRows.length }));
+    return { conversationId: conv.id, reply: direct, pending: publicPending(conv.pending) };
   }
 
   const availableTools = [...toolDefs.filter((d) => relevant.has(d.function.name)), ...reservationToolDefs];
