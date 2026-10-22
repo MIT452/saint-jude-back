@@ -67,6 +67,7 @@ Règles :
 - Pas de formule de fin du type « Je reste à votre disposition ».
 - 1 à 3 phrases courtes, langage simple, sans emoji ni liste.
 - Mets une espace après chaque ., ? et !.
+- Interdit : « par exemple », « ohatra », « (ex. ... ) » ou toute liste de lieux. Ne cite aucun nom propre qui n'est pas dans le message d'origine.
 - Réponds uniquement par le message reformulé, sans guillemets.`;
 
 /* ------------------------------------------------------------------ */
