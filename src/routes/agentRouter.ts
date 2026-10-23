@@ -3,7 +3,8 @@
 //   POST /api/ai/agent/chat     conversation (aucun effet sur les réservations)
 //   POST /api/ai/agent/confirm  action humaine : enregistre la réservation préparée
 //   POST /api/ai/agent/cancel   abandonne le brouillon
-// Les fonctions du backend sont injectées depuis ai.ts (pas d'import circulaire).
+// Les fonctions du backend sont injectées depuis ai.ts (pas d'import circulaire :
+// seuls des TYPES sont importés depuis ai.js).
 
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { runAgent, type AgentDeps } from '../ai/agent.js';
@@ -18,6 +19,18 @@ interface Deps extends AgentDeps {
 const userIdOf = (res: Response): string | null => {
   const u = res.locals.sessionUser as SessionUserLite | undefined;
   return u?.id ? String(u.id) : null;
+};
+
+/**
+ * Message de retour fidèle au statut réellement enregistré par reserveTrip :
+ * « confirmée » si la contrainte de la base accepte ce statut, « En attente » sinon.
+ */
+const confirmationReply = (o: { id: string; price: number; confirmed: boolean }): string => {
+  const ref = `#${o.id.slice(0, 8)}`;
+  const amount = `${o.price.toLocaleString('fr-FR')} Ar`;
+  return o.confirmed
+    ? `Votre réservation ${ref} est confirmée. Montant à payer : ${amount}.`
+    : `Votre réservation a été enregistrée sous le numéro ${ref} avec le statut « En attente ». Montant à payer : ${amount}.`;
 };
 
 export function createAgentRouter(deps: Deps) {
@@ -52,6 +65,8 @@ export function createAgentRouter(deps: Deps) {
       const sessionUser = res.locals.sessionUser as SessionUserLite | undefined;
       let outcome: ReserveOutcome;
       try {
+        // reserveTrip revérifie le voyage, la capacité et le tarif sous verrou, puis enregistre
+        // la réservation directement avec le statut « confirmée » (le client accepte les conditions).
         outcome = await deps.reserveTrip(
           {
             depart: p.depart,
@@ -83,7 +98,7 @@ export function createAgentRouter(deps: Deps) {
         return res.status(409).json({ ok: false, error: outcome.message });
       }
 
-      const reply = `Votre réservation a été enregistrée sous le numéro #${outcome.id.slice(0, 8)} avec le statut « En attente ». Montant à payer : ${outcome.price.toLocaleString('fr-FR')} Ar.`;
+      const reply = confirmationReply(outcome);
       // le modèle saura, au prochain message, que la réservation existe
       conv.messages.push({ role: 'assistant', content: reply });
       await saveConv(conv);
@@ -93,6 +108,7 @@ export function createAgentRouter(deps: Deps) {
         reply,
         reservationId: outcome.id,
         reservation: outcome.reservation,
+        confirmed: outcome.confirmed,
         pending: null,
       });
     } catch (error) {
