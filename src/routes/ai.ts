@@ -10,7 +10,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-22-agent';
+const BUILD = 'ai-2026-10-23-confirm-immediate';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -191,6 +191,7 @@ const PAYMENT_STATUS_INIT = false;
 
 // Capacité en PLACES (somme des quantités), comme le garde-fou de server.ts (capacityGuard.ts).
 // Les réservations refusées, annulées ou no-show ne consomment pas de place.
+// Les réservations confirmées ET en attente consomment une place.
 const USED_SQL = `COALESCE((SELECT SUM(r.quantity) FROM reservations r
                     WHERE r."tripId" = t.id
                       AND UPPER(COALESCE(r.status, '')) NOT IN
@@ -826,6 +827,107 @@ async function getReservationColumns(db: Db): Promise<Set<string>> {
 }
 
 /* =========================================================
+   Statut « confirmée » : lu dans la contrainte chk_reservation_status
+   (ou forcé avec la variable RESERVATION_CONFIRMED_STATUS sur Render).
+   Si la contrainte n'accepte aucune valeur « confirmée », on retombe sur
+   EN_ATTENTE (comportement d'avant) et on l'écrit dans les logs.
+========================================================= */
+const STATUS_PENDING = 'EN_ATTENTE';
+const CONFIRMED_CANDIDATES = ['CONFIRMEE', 'CONFIRMÉE', 'CONFIRMED', 'CONFIRME', 'CONFIRMÉ'];
+let confirmedStatusCache: string | null = null;
+
+async function getConfirmedStatus(): Promise<string> {
+  if (confirmedStatusCache) return confirmedStatusCache;
+
+  const forced = (process.env.RESERVATION_CONFIRMED_STATUS ?? '').trim();
+  if (forced) return (confirmedStatusCache = forced);
+
+  try {
+    const { rows } = await defaultDb.query(
+      `SELECT pg_get_constraintdef(oid) AS def FROM pg_constraint WHERE conname = 'chk_reservation_status'`,
+    );
+    const def = String(rows[0]?.def ?? '');
+    const found = CONFIRMED_CANDIDATES.find((c) => def.includes(`'${c}'`));
+    if (found) return (confirmedStatusCache = found);
+    console.warn(
+      `[IA] aucun statut « confirmée » trouvé dans chk_reservation_status (${def.slice(0, 200)}). ` +
+        'Définissez RESERVATION_CONFIRMED_STATUS ou modifiez la contrainte. Repli : EN_ATTENTE.',
+    );
+  } catch (err) {
+    console.warn(`[IA] lecture de chk_reservation_status impossible : ${safeError(err)}`);
+  }
+  return STATUS_PENDING; // non mémorisé : on réessaiera à la prochaine réservation
+}
+
+/* =========================================================
+   Notifications (n8n) : file d'envoi « outbox »
+   - l'événement est écrit dans la MÊME transaction que la réservation ;
+   - l'envoi à n8n se fait après le COMMIT, avec nouvelles tentatives ;
+   - UNIQUE (event, reservation_id) : jamais deux messages pour le même événement.
+   Désactivé tant que N8N_WEBHOOK_URL n'est pas défini sur Render.
+========================================================= */
+const n8nUrl = () => (process.env.N8N_WEBHOOK_URL ?? '').trim();
+
+let outboxReady = false;
+async function ensureOutboxTable() {
+  if (outboxReady) return;
+  await defaultDb.query(
+    `CREATE TABLE IF NOT EXISTS notification_outbox (
+       id             BIGSERIAL PRIMARY KEY,
+       event          TEXT NOT NULL,
+       reservation_id TEXT NOT NULL,
+       payload        JSONB NOT NULL,
+       attempts       INT NOT NULL DEFAULT 0,
+       sent_at        TIMESTAMPTZ,
+       created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+       UNIQUE (event, reservation_id)
+     )`,
+  );
+  outboxReady = true;
+}
+
+let flushing = false;
+export async function flushOutbox() {
+  const url = n8nUrl();
+  if (!url || flushing) return;
+  flushing = true;
+  try {
+    await ensureOutboxTable();
+    const { rows } = await defaultDb.query(
+      `SELECT id, event, payload FROM notification_outbox
+       WHERE sent_at IS NULL AND attempts < 5 ORDER BY id LIMIT 20`,
+    );
+    for (const r of rows) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Webhook-Secret': (process.env.N8N_WEBHOOK_SECRET ?? '').trim(),
+          },
+          body: JSON.stringify({ notification_id: r.id, event: r.event, ...r.payload }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!res.ok) throw new Error(`n8n ${res.status}`);
+        await defaultDb.query(`UPDATE notification_outbox SET sent_at = now() WHERE id = $1`, [r.id]);
+      } catch (err) {
+        console.warn(`[IA] notification ${r.id} non envoyée : ${safeError(err)}`);
+        await defaultDb.query(`UPDATE notification_outbox SET attempts = attempts + 1 WHERE id = $1`, [r.id]);
+      }
+    }
+  } catch (err) {
+    console.warn(`[IA] outbox indisponible : ${safeError(err)}`);
+  } finally {
+    flushing = false;
+  }
+}
+
+// Reprise des envois en échec (l'instance gratuite de Render se met en veille)
+if (n8nUrl()) {
+  setInterval(() => void flushOutbox(), 60_000).unref?.();
+}
+
+/* =========================================================
    LLM Provider (Ollama local / OpenAI ou Groq en prod)
 ========================================================= */
 interface ChatMessage {
@@ -1000,6 +1102,8 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
       sample: out.trim().slice(0, 20),
       keys,
       humanize: process.env.AI_HUMANIZE === '1',
+      notifications: Boolean(n8nUrl()),
+      confirmedStatus: confirmedStatusCache,
     });
   } catch (error) {
     return res.status(503).json({
@@ -1039,6 +1143,9 @@ async function answerGeneral(question: string, _places: string[]): Promise<strin
 /* =========================================================
    Création d'une réservation (transaction + verrou sur le voyage)
    Utilisée par POST /api/ai/reserve (front) et par la confirmation du chat.
+   Le client qui clique sur « Confirmer » accepte les conditions : la réservation
+   est donc enregistrée directement comme confirmée. Le paiement reste « non payé »
+   (paymentStatus = false, amountPaid = 0, amountToPay = prix).
 ========================================================= */
 export interface ReserveInput {
   depart: string;
@@ -1078,18 +1185,34 @@ export interface ReservationSummary {
   totalWeightKg: number;
   unitPrice: number;
   totalPrice: number;
-  status: 'EN_ATTENTE';
+  status: string; // valeur réellement enregistrée (ex. CONFIRMEE ou EN_ATTENTE)
 }
 
 export type ReserveOutcome =
-  | { ok: true; id: string; price: number; reservation: ReservationSummary }
+  | { ok: true; id: string; price: number; confirmed: boolean; reservation: ReservationSummary }
   | { ok: false; message: string };
 
+/** Message de retour au client, fidèle au statut réellement enregistré. */
+export function confirmationMessage(o: { id: string; price: number; confirmed: boolean }): string {
+  const ref = `#${o.id.slice(0, 8)}`;
+  const amount = `${o.price.toLocaleString('fr-FR')} Ar`;
+  return o.confirmed
+    ? `Votre réservation ${ref} est confirmée. Montant à payer : ${amount}.`
+    : `Votre réservation a été enregistrée sous le numéro ${ref} avec le statut « En attente ». Montant à payer : ${amount}.`;
+}
+
 export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): Promise<ReserveOutcome> {
-  const client = await pool.connect();
-  const tx = client as unknown as Db;
   const qty = input.quantite;
   const total = input.poidsTotalKg;
+
+  // Préparations hors transaction (lecture du statut autorisé, table de notifications)
+  const status = await getConfirmedStatus();
+  const confirmed = status !== STATUS_PENDING;
+  const notify = Boolean(n8nUrl());
+  if (notify) await ensureOutboxTable().catch((err) => console.warn(`[IA] outbox : ${safeError(err)}`));
+
+  const client = await pool.connect();
+  const tx = client as unknown as Db;
 
   try {
     await client.query('BEGIN');
@@ -1105,7 +1228,7 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
     }
     await client.query('SELECT id FROM trips WHERE id = $1 FOR UPDATE', [first.tripId]);
 
-    // 2) revérification sous verrou : la capacité est recalculée à jour
+    // 2) revérification sous verrou : capacité, bateau, tarif recalculés à jour
     const check = await verifyTrip(
       {
         depart: input.depart,
@@ -1129,14 +1252,14 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
       'Client IA';
     const cols = await getReservationColumns(tx);
 
-    // Statut 'EN_ATTENTE' (contrainte chk_reservation_status). paymentStatus est un booléen : false = non payé.
+    // Statut contrôlé par chk_reservation_status. paymentStatus est un booléen : false = non payé.
     const fields: Array<[string, unknown]> = [
       ['clientName', clientName],
       ['tripId', check.tripId],
       ['quantity', qty],
       ['weight', total],
       ['totalPrice', price],
-      ['status', 'EN_ATTENTE'],
+      ['status', status],
     ];
     if (cols.has('amountPaid')) fields.push(['amountPaid', 0]);
     if (cols.has('amountToPay')) fields.push(['amountToPay', price]);
@@ -1145,6 +1268,7 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
     if (cols.has('paymentStatus')) fields.push(['paymentStatus', PAYMENT_STATUS_INIT]);
     if (cols.has('userId') && user?.id) fields.push(['userId', user.id]);
     if (cols.has('clientTel') && user?.tel) fields.push(['clientTel', user.tel]);
+    if (confirmed && cols.has('confirmedAt')) fields.push(['confirmedAt', new Date().toISOString()]);
 
     const names = fields.map(([n]) => `"${n}"`).join(', ');
     const slots = fields.map((_f, idx) => `$${idx + 1}`).join(', ');
@@ -1180,12 +1304,48 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
       ],
     );
 
+    // Événement de notification : écrit dans la même transaction que la réservation
+    if (notify) {
+      await client.query(
+        `INSERT INTO notification_outbox (event, reservation_id, payload)
+         VALUES ($1, $2, $3::jsonb)
+         ON CONFLICT (event, reservation_id) DO NOTHING`,
+        [
+          confirmed ? 'reservation.confirmed' : 'reservation.pending',
+          reservationId,
+          JSON.stringify({
+            numero: reservationId.slice(0, 8),
+            client_nom: clientName,
+            email: user?.email ?? '',
+            telephone: user?.tel ?? '',
+            marchandise: itemName,
+            quantite: qty,
+            unite: input.unite ?? '',
+            poids_kg: total,
+            depart: check.from ?? input.depart,
+            arrivee: check.to ?? input.arrivee,
+            date: input.date,
+            navire: check.boatName ?? '',
+            total: price,
+            paye: 0,
+            solde: price,
+            statut_reservation: status,
+            statut_paiement: 'Non payé',
+          }),
+        ],
+      );
+    }
+
     await client.query('COMMIT');
+
+    // Envoi à n8n APRÈS le COMMIT : le message ne part que si la réservation est bien en base
+    if (notify) void flushOutbox();
 
     return {
       ok: true,
       id: reservationId,
       price,
+      confirmed,
       reservation: {
         id: reservationId,
         clientName,
@@ -1204,7 +1364,7 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
         totalWeightKg: total,
         unitPrice,
         totalPrice: price,
-        status: 'EN_ATTENTE',
+        status,
       },
     };
   } catch (error) {
@@ -1362,10 +1522,10 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
 
       draft = {};
       quoteSummary = null;
-      return send(
-        `Votre réservation a été enregistrée sous le numéro #${outcome.id.slice(0, 8)} avec le statut « En attente ». Montant à payer : ${outcome.price.toLocaleString('fr-FR')} Ar.`,
-        { reservationCreated: true, reservationId: outcome.id },
-      );
+      return send(confirmationMessage(outcome), {
+        reservationCreated: true,
+        reservationId: outcome.id,
+      });
     }
 
     if (draft.awaitingConfirm && isNo(question)) {
@@ -1648,7 +1808,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       draft.awaitingConfirm = true;
 
       const boat = draft.boatName ? ` sur le navire ${draft.boatName}` : '';
-      reply = `${prefix}J'ai vérifié nos disponibilités : un transport est disponible le ${draft.dateFormatted} entre ${draft.departure} et ${draft.destination}${boat}. Pour vos ${draft.totalWeightKg} kg de ${draft.cargoType}, le tarif calculé est de ${(result.totalPrice ?? 0).toLocaleString('fr-FR')} Ar. Souhaitez-vous confirmer cette réservation ?`;
+      reply = `${prefix}J'ai vérifié nos disponibilités : un transport est disponible le ${draft.dateFormatted} entre ${draft.departure} et ${draft.destination}${boat}. Pour vos ${draft.totalWeightKg} kg de ${draft.cargoType}, le tarif calculé est de ${(result.totalPrice ?? 0).toLocaleString('fr-FR')} Ar. En confirmant, vous acceptez ces conditions et la réservation est enregistrée immédiatement. Souhaitez-vous confirmer cette réservation ?`;
 
       quoteSummary = {
         departure: draft.departure,
