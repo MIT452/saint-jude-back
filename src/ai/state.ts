@@ -6,6 +6,16 @@ import { randomUUID } from 'node:crypto';
 import { pool } from '../db.js';
 import type { Msg } from './llm.js';
 
+/** Mode de paiement choisi par le client dans le chat. */
+export const PAYMENT_METHODS = ['CAISSE', 'BANQUE', 'CREDIT'] as const;
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+export const PAYMENT_LABEL: Record<PaymentMethod, string> = {
+  CAISSE: 'Caisse',
+  BANQUE: 'Banque',
+  CREDIT: 'Crédit',
+};
+
 /** Réservation préparée par l'IA, en attente du clic « Confirmer » (jamais enregistrée par l'IA). */
 export interface Pending {
   depart: string;
@@ -17,6 +27,11 @@ export interface Pending {
   unite?: string;
   prix?: number; // informatif : le prix est recalculé par reserveTrip à la confirmation
   boatName?: string;
+  /**
+   * Choix du client. Optionnel dans le type pour rester compatible avec les anciens brouillons
+   * déjà en base : la route /confirm doit utiliser 'CAISSE' si la valeur est absente.
+   */
+  paymentMethod?: PaymentMethod;
   expiresAt: number; // timestamp ms
 }
 
@@ -142,5 +157,7 @@ export function publicPending(p: Pending | null) {
     date: p.date,
     prix: p.prix ?? null,
     bateau: p.boatName ?? null,
+    modePaiement: p.paymentMethod ?? null,
+    modePaiementLabel: p.paymentMethod ? PAYMENT_LABEL[p.paymentMethod] : null,
   };
 }

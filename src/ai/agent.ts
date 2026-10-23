@@ -7,7 +7,18 @@ import { chat, safeError, type Msg } from './llm.js';
 import { tools, toolDefs } from './tools.js';
 import { findRelevantTools } from './jit.js';
 import { defaultKnowledge, retrieveKnowledge } from './rag.js';
-import { loadConv, newPendingExpiry, publicPending, saveConv, trim, type Conv, type Pending } from './state.js';
+import {
+  loadConv,
+  newPendingExpiry,
+  publicPending,
+  saveConv,
+  trim,
+  PAYMENT_LABEL,
+  PAYMENT_METHODS,
+  type Conv,
+  type Pending,
+  type PaymentMethod,
+} from './state.js';
 import type { VerifyInput, VerifyResult } from '../routes/ai.js'; // types seulement : pas d'import circulaire
 
 const MAX_STEPS = Number(process.env.AI_MAX_STEPS ?? 6);
@@ -42,7 +53,7 @@ const todayLong = () =>
 function buildSystemPrompt(ctx: Ctx, places: string[], documents: string, boatsData = ''): string {
   const p = ctx.conv.pending;
   const pendingText = p
-    ? `\nRÉSERVATION EN ATTENTE DE CONFIRMATION (déjà préparée) : ${p.quantite} ${p.unite ?? 'unité(s)'} de ${p.marchandise}, ${p.poidsTotalKg} kg, ${p.depart} → ${p.arrivee}, le ${p.date}${p.prix ? `, ${p.prix} Ar` : ''}. Le client doit cliquer sur « Confirmer ». Si le client change un élément, appelle de nouveau preparer_reservation.`
+    ? `\nRÉSERVATION EN ATTENTE DE CONFIRMATION (déjà préparée) : ${p.quantite} ${p.unite ?? 'unité(s)'} de ${p.marchandise}, ${p.poidsTotalKg} kg, ${p.depart} → ${p.arrivee}, le ${p.date}${p.prix ? `, ${p.prix} Ar` : ''}. ${p.paymentMethod ? ` Mode de paiement choisi : ${PAYMENT_LABEL[p.paymentMethod]}.` : ' Mode de paiement NON choisi : demande-le au client (Caisse, Banque ou Crédit).'} Le client doit cliquer sur « Confirmer » seulement une fois le mode de paiement choisi. Si le client change un élément, appelle de nouveau preparer_reservation.`
     : '';
 
   const boatsText = boatsData
@@ -68,6 +79,11 @@ CONVERSATION
 - Si le client donne un poids par unité (« 50 kg chacun »), calcule le poids total toi-même. Si c'est ambigu (« 3 sacs, 100 kg »), demande s'il s'agit du poids de chaque sac ou du total.
 - Pour toute date relative (« demain », « vendredi », « rahampitso »), appelle convertir_date. Si le résultat est ambigu, demande confirmation de la date au client.
 - Tu peux répondre normalement aux salutations et à la conversation courante, puis ramener la discussion vers le transport.
+
+PAIEMENT
+- Après le récapitulatif, demande UNE fois : « Comment souhaitez-vous payer : Caisse, Banque ou Crédit ? ». Dès que le client répond, appelle choisir_mode_paiement (caisse, espèces = CAISSE ; banque, virement = BANQUE ; crédit = CREDIT). Ne devine jamais le mode.
+- Caisse : le client règle à la caisse. Banque : le client règle par virement. Crédit : la demande reste « En attente » jusqu'à validation par l'équipe ; ne promets JAMAIS qu'un crédit est accordé.
+- Ne dis pas au client de cliquer sur « Confirmer » tant que le mode de paiement n'est pas choisi.
 
 RÈGLES STRICTES
 - Aucun prix, horaire, disponibilité, nombre de places ou nom de bateau sans avoir appelé l'outil correspondant (ou sans l'avoir lu dans les DONNÉES BATEAUX ci-dessous). N'invente jamais un chiffre.
@@ -152,6 +168,19 @@ const reservationToolDefs = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'choisir_mode_paiement',
+      description:
+        "Enregistre le mode de paiement choisi par le client pour la réservation déjà préparée. À appeler seulement après que le client a répondu Caisse, Banque ou Crédit.",
+      parameters: {
+        type: 'object',
+        properties: { mode: { type: 'string', enum: ['CAISSE', 'BANQUE', 'CREDIT'] } },
+        required: ['mode'],
+      },
+    },
+  },
 ];
 
 const RESERVATION_TOOLS = new Set(reservationToolDefs.map((d) => d.function.name));
@@ -161,6 +190,28 @@ async function runReservationTool(name: string, a: Record<string, unknown>, ctx:
     const r = ctx.deps.parseRelativeDate(String(a.texte ?? ''));
     if (!r) return { erreur: 'Date non reconnue : demande au client de la préciser.' };
     return { date: r.dateStr, lisible: r.formatted, ambigue: r.ambiguous };
+  }
+
+  if (name === 'choisir_mode_paiement') {
+    const mode = String(a.mode ?? '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase()
+      .trim();
+    if (!(PAYMENT_METHODS as readonly string[]).includes(mode)) {
+      return { erreur: 'mode invalide : CAISSE, BANQUE ou CREDIT' };
+    }
+    if (!ctx.conv.pending) return { erreur: "Aucune réservation préparée : prépare d'abord la réservation." };
+    ctx.conv.pending.paymentMethod = mode as PaymentMethod;
+    ctx.conv.pending.expiresAt = newPendingExpiry();
+    return {
+      statut: 'EN_ATTENTE_CONFIRMATION',
+      mode_paiement: mode,
+      consigne:
+        mode === 'CREDIT'
+          ? "Dis au client que sa demande de crédit sera enregistrée « En attente » et validée par l'équipe, puis de cliquer sur Confirmer. Rien n'est enregistré."
+          : 'Rappelle le mode choisi et dis au client de cliquer sur Confirmer. Rien n’est enregistré.',
+    };
   }
 
   const depart = asText(a.depart);
@@ -207,6 +258,7 @@ async function runReservationTool(name: string, a: Record<string, unknown>, ctx:
     unite: asText(a.unite, 20),
     prix: result.totalPrice,
     boatName: result.boatName,
+    paymentMethod: ctx.conv.pending?.paymentMethod, // conservé si le client modifie un autre élément
     expiresAt: newPendingExpiry(),
   };
   ctx.conv.pending = pending;
@@ -221,8 +273,11 @@ async function runReservationTool(name: string, a: Record<string, unknown>, ctx:
       date,
       bateau: pending.boatName ?? null,
       prix_total: pending.prix ?? null,
+      mode_paiement: pending.paymentMethod ?? null,
     },
-    consigne: 'Présente ce récapitulatif au client et dis-lui de cliquer sur le bouton Confirmer. Rien n’est enregistré.',
+    consigne: pending.paymentMethod
+      ? 'Présente ce récapitulatif au client et dis-lui de cliquer sur le bouton Confirmer. Rien n’est enregistré.'
+      : 'Présente ce récapitulatif, puis demande au client : Caisse, Banque ou Crédit ? Rien n’est enregistré.',
   };
 }
 
