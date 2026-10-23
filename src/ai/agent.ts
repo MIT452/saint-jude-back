@@ -306,6 +306,16 @@ const norm = (s: string) =>
     .toLowerCase()
     .trim();
 
+/** Détecte le mode de paiement dit par le client (null si absent ou ambigu). */
+function detectPayment(message: string): PaymentMethod | null {
+  const t = norm(message);
+  const found: PaymentMethod[] = [];
+  if (/\b(caisse|cash|especes?)\b/.test(t)) found.push('CAISSE');
+  if (/\b(banque|bank|virement)\b/.test(t)) found.push('BANQUE');
+  if (/\bcredit\b/.test(t)) found.push('CREDIT');
+  return found.length === 1 ? found[0] : null;
+}
+
 type BoatRow = { name?: unknown; capacity?: unknown; state?: unknown };
 
 const boatLine = (b: BoatRow) => `- **${String(b.name ?? 'Bateau')}** : ${String(b.capacity ?? '?')} tonnes, ${String(b.state ?? 'état inconnu')}`;
@@ -332,6 +342,15 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
   const conv = await loadConv(input.conversationId, input.userId);
   const ctx: Ctx = { conv, deps };
   conv.messages.push({ role: 'user', content: input.message });
+
+  // Choix du mode de paiement détecté par le code : fiable, sans dépendre du modèle
+  if (conv.pending && !conv.pending.paymentMethod) {
+    const chosen = detectPayment(input.message);
+    if (chosen) {
+      conv.pending.paymentMethod = chosen;
+      conv.pending.expiresAt = newPendingExpiry();
+    }
+  }
 
   const [places, documents] = await Promise.all([
     deps.getKnownPlaces().catch(() => [] as string[]),
@@ -424,6 +443,12 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
     reply = conv.pending
       ? "Votre réservation est prête mais pas encore enregistrée : cliquez sur « Confirmer » pour la valider."
       : "Rien n'a été enregistré pour le moment. Dites-moi ce que vous souhaitez envoyer.";
+  }
+
+  // Garde-fou paiement : tant que le mode n'est pas choisi, le code pose la question lui-même
+  if (conv.pending && !conv.pending.paymentMethod) {
+    reply = reply.replace(/[^.!?\n]*Confirmer[^.!?\n]*[.!?]?/gi, '').trim();
+    reply = `${reply}\n\nComment souhaitez-vous payer : **Caisse**, **Banque** ou **Crédit** ?`.trim();
   }
 
   conv.messages.push({ role: 'assistant', content: reply });
