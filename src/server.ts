@@ -10,6 +10,8 @@ import { analyticsRouter } from './routes/analytics.js';
 import { dataAnalysisRouter } from './routes/dataAnalysis.js'; // AJOUT ANALYSE DES DONNEES 1/2
 import aiCapabilitiesRouter from './routes/ai-capabilities.js';
 import reservationAiRouter from './routes/reservations-ai.js';
+import reservationListRouter from './routes/reservationList.js';
+import { reservationAccessGuard } from './routes/reservationGuard.js';
 import reservationStatusRouter from './routes/reservationStatus.js';
 import { positionsRouter } from './routes/positions.js';
 import { optimizationRouter } from './routes/optimization.js';
@@ -126,6 +128,14 @@ app.use(
   reservationAiRouter
 );
 
+/*
+ * CONTRÔLE D'ACCÈS DES RÉSERVATIONS
+ * Doit rester AVANT reservationStatusRouter et la route générique ci-dessous :
+ *  - admin : tout est autorisé ;
+ *  - client : uniquement ses propres réservations, et seulement les annuler.
+ */
+app.use('/api/reservations', requireAuth, reservationAccessGuard);
+
 app.use(
   '/api/reservations',
   requireAuth,
@@ -140,6 +150,12 @@ app.use(
     booleanFields: ['paymentStatus'],
   })
 );
+
+/*
+ * Liste des réservations pour le tableau (format ReservationRecord) :
+ * un client reçoit les siennes, l'admin reçoit tout (ou ?userId=...).
+ */
+app.use('/api/my-reservations', requireAuth, reservationListRouter);
 
 app.use(
   '/api/trips',

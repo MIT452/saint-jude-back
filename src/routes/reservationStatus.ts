@@ -19,6 +19,9 @@ const ALLOWED_TRANSITIONS: Record<string, string[]> = {
   TERMINEE: [],
 };
 
+// Le contrôle d'accès (admin / propriétaire de la réservation) est fait par
+// reservationAccessGuard, monté juste avant ce routeur dans server.ts.
+
 router.get('/:id', async (req: Request, res: Response) => {
   try {
     const { rows } = await pool.query(
@@ -36,7 +39,7 @@ router.get('/:id', async (req: Request, res: Response) => {
         "userId" AS userId
        FROM reservations
        WHERE id = $1`,
-      [req.params.id]
+      [req.params.id],
     );
 
     if (rows.length === 0) {
@@ -71,12 +74,13 @@ router.patch('/:id/status', async (req: Request, res: Response) => {
       return res.status(409).json({ error: `Transition ${currentStatus} → ${nextStatus} interdite` });
     }
 
+    // CORRECTION : les valeurs $1 et $2 n'étaient pas transmises (erreur 500 à chaque appel)
     const { rows } = await pool.query(
       `UPDATE reservations
        SET status = $1
        WHERE id = $2
        RETURNING id, status`,
-      [nextStatus, req.params.id]
+      [nextStatus, req.params.id],
     );
 
     return res.json({ id: rows[0].id, status: rows[0].status });
