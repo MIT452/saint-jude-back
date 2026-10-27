@@ -1193,12 +1193,20 @@ export type ReserveOutcome =
   | { ok: false; message: string };
 
 /** Message de retour au client, fidèle au statut réellement enregistré. */
-export function confirmationMessage(o: { id: string; price: number; confirmed: boolean }): string {
+export function confirmationMessage(o: {
+  id: string;
+  price: number;
+  confirmed: boolean;
+  reservation?: { clientEmail?: string };
+}): string {
   const ref = `#${o.id.slice(0, 8)}`;
   const amount = `${o.price.toLocaleString('fr-FR')} Ar`;
-  return o.confirmed
+  const base = o.confirmed
     ? `Votre réservation ${ref} est confirmée. Montant à payer : ${amount}.`
     : `Votre réservation a été enregistrée sous le numéro ${ref} avec le statut « En attente ». Montant à payer : ${amount}.`;
+  // On n'annonce l'e-mail que s'il peut vraiment partir (n8n actif et adresse connue)
+  const mail = n8nUrl() && o.reservation?.clientEmail ? ' Un e-mail de confirmation vous est envoyé.' : '';
+  return `${base} Retrouvez-la dans le Tableau des réservations.${mail}`;
 }
 
 export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): Promise<ReserveOutcome> {
