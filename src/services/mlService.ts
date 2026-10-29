@@ -68,7 +68,7 @@ async function callForecast(
     throw new Error(`Erreur ML (${target}): ${res.status} – ${text}`);
   }
 
-  return res.json();
+  return (await res.json()) as ForecastPoint[];
 }
 
 export async function getDemandForecast(reservations: any[], periods = 30) {
