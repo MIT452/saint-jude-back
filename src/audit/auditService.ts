@@ -48,14 +48,25 @@ export function computeHash(prev: string, f: HashFields): string {
 // Madagascar = UTC+3, sans changement d'heure
 const madagascarHour = () => (new Date().getUTCHours() + 3) % 24;
 
+const emailFromDetails = (details: unknown): string | null => {
+  if (details && typeof details === "object" && "email" in details) {
+    const email = (details as { email: unknown }).email;
+    return typeof email === "string" && email ? email.toLowerCase() : null;
+  }
+  return null;
+};
+
 // Règles déterministes : ce sont elles qui décident du statut, pas le LLM
 async function classify(e: AuditEvent): Promise<{ status: "NORMAL" | "SUSPECT" | "CRITIQUE"; rule?: string }> {
   if (e.action === "LOGIN_FAILED") {
+    // On compte les échecs de la même IP OU visant le même compte (e-mail) :
+    // changer d'IP ne contourne donc pas la détection.
     const { rows } = await pool.query<{ n: number }>(
       `SELECT count(*)::int AS n FROM audit_logs
-       WHERE action = 'LOGIN_FAILED' AND ip_address = $1
-         AND created_at > now() - interval '10 minutes'`,
-      [e.ip ?? null],
+       WHERE action = 'LOGIN_FAILED'
+         AND created_at > now() - interval '10 minutes'
+         AND (ip_address = $1::inet OR lower(details->>'email') = $2::text)`,
+      [e.ip ?? null, emailFromDetails(e.details)],
     );
     const attempts = (rows[0]?.n ?? 0) + 1;
     if (attempts >= 5) return { status: "CRITIQUE", rule: "BRUTE_FORCE" };
