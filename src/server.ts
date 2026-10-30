@@ -27,6 +27,7 @@ import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // 
 import { audit } from './audit/auditMiddleware.js'; // AJOUT AUDIT 1/3
 import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
 import { access } from './utils/accessPolicy.js'; // AJOUT DROITS
+import accessRouter from './routes/access.js'; // AJOUT DROITS : /api/access/me
 
 const app = express();
 
@@ -99,6 +100,12 @@ app.use('/api/auth', authRouter);
 ========================= */
 
 app.use('/api/audit', requireAuth, requireOwner, auditRouter); // AJOUT AUDIT 3/3
+
+/* =========================
+   DROITS DU COMPTE CONNECTÉ
+========================= */
+
+app.use('/api/access', requireAuth, accessRouter);
 
 /* =========================
    GARDE-FOU DE CAPACITÉ
