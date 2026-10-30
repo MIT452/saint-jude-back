@@ -26,7 +26,7 @@ import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
 import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // AJOUT AIOPS 1/3
 import { audit } from './audit/auditMiddleware.js'; // AJOUT AUDIT 1/3
 import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
-import { fuelRouter } from './routes/fuel.js'; // AJOUT CARBURANT 1/2
+import { access } from './utils/accessPolicy.js'; // AJOUT DROITS
 
 const app = express();
 
@@ -109,7 +109,9 @@ app.post('/api/reservations', requireAuth, checkCapacity); // AJOUT 2/2
 
 /* =========================
    CRUD ROUTES
-   audit(...) se place APRÈS requireAuth, juste avant le routeur.
+   Ordre : requireAuth -> audit(...) -> access(...) -> routeur.
+   access(...) applique la matrice de src/utils/accessPolicy.ts
+   (variable ACCESS_MODE : report par défaut, enforce pour bloquer).
 ========================= */
 
 app.use(
@@ -129,6 +131,7 @@ app.use(
   '/api/goods',
   requireAuth,
   audit('goods'),
+  access('goods'),
   createCrudRouter({
     table: 'goods',
     booleanFields: ['status'],
@@ -176,6 +179,7 @@ app.use(
   '/api/trips',
   requireAuth,
   audit('trips'),
+  access('trips'),
   createCrudRouter({
     table: 'trips',
   })
@@ -185,6 +189,7 @@ app.use(
   '/api/boats',
   requireAuth,
   audit('boats'),
+  access('boats'),
   createCrudRouter({
     table: 'boats',
     jsonFields: ['crew'],
@@ -195,19 +200,17 @@ app.use(
   '/api/cashmovements',
   requireAuth,
   audit('cashmovements'),
+  access('cashmovements'),
   createCrudRouter({
     table: 'cashmovements',
   })
 );
 
-// AJOUT CARBURANT 2/2 : POST /api/fuelconsumptions/refuel (plein + caisse en une transaction).
-// Doit rester AVANT le CRUD générique ci-dessous.
-app.use('/api/fuelconsumptions', requireAuth, audit('fuelconsumptions'), fuelRouter);
-
 app.use(
   '/api/fuelconsumptions',
   requireAuth,
   audit('fuelconsumptions'),
+  access('fuelconsumptions'),
   createCrudRouter({
     table: 'fuelconsumptions',
   })
