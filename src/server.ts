@@ -26,6 +26,7 @@ import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
 import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // AJOUT AIOPS 1/3
 import { audit } from './audit/auditMiddleware.js'; // AJOUT AUDIT 1/3
 import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
+import { fuelRouter } from './routes/fuel.js'; // AJOUT CARBURANT 1/2
 
 const app = express();
 
@@ -198,6 +199,10 @@ app.use(
     table: 'cashmovements',
   })
 );
+
+// AJOUT CARBURANT 2/2 : POST /api/fuelconsumptions/refuel (plein + caisse en une transaction).
+// Doit rester AVANT le CRUD générique ci-dessous.
+app.use('/api/fuelconsumptions', requireAuth, audit('fuelconsumptions'), fuelRouter);
 
 app.use(
   '/api/fuelconsumptions',
