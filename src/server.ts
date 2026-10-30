@@ -24,6 +24,8 @@ import { requireAuth, requireOwner, requireTrustedOrigin } from './utils/authSes
 import { pool } from './db.js';
 import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
 import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // AJOUT AIOPS 1/3
+import { audit } from './audit/auditMiddleware.js'; // AJOUT AUDIT 1/3
+import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
 
 const app = express();
 
@@ -91,6 +93,13 @@ app.get('/metrics', metricsHandler); // AJOUT AIOPS 3/3
 app.use('/api/auth', authRouter);
 
 /* =========================
+   JOURNAL D'AUDIT (lecture, vérification, revue des alertes)
+   Réservé au Propriétaire.
+========================= */
+
+app.use('/api/audit', requireAuth, requireOwner, auditRouter); // AJOUT AUDIT 3/3
+
+/* =========================
    GARDE-FOU DE CAPACITÉ
    Doit rester AVANT toutes les routes /api/reservations
 ========================= */
@@ -99,12 +108,14 @@ app.post('/api/reservations', requireAuth, checkCapacity); // AJOUT 2/2
 
 /* =========================
    CRUD ROUTES
+   audit(...) se place APRÈS requireAuth, juste avant le routeur.
 ========================= */
 
 app.use(
   '/api/user',
   requireAuth,
   requireOwner,
+  audit('user'),
   createCrudRouter({
     table: 'user',
     jsonFields: ['permissions'],
@@ -116,6 +127,7 @@ app.use(
 app.use(
   '/api/goods',
   requireAuth,
+  audit('goods'),
   createCrudRouter({
     table: 'goods',
     booleanFields: ['status'],
@@ -125,6 +137,7 @@ app.use(
 app.use(
   '/api/reservations/ai',
   requireAuth,
+  audit('reservations-ai'),
   reservationAiRouter
 );
 
@@ -133,8 +146,9 @@ app.use(
  * Doit rester AVANT reservationStatusRouter et la route générique ci-dessous :
  *  - admin : tout est autorisé ;
  *  - client : uniquement ses propres réservations, et seulement les annuler.
+ * L'audit est placé ici pour couvrir aussi reservationStatusRouter et le CRUD.
  */
-app.use('/api/reservations', requireAuth, reservationAccessGuard);
+app.use('/api/reservations', requireAuth, audit('reservations'), reservationAccessGuard);
 
 app.use(
   '/api/reservations',
@@ -160,6 +174,7 @@ app.use('/api/my-reservations', requireAuth, reservationListRouter);
 app.use(
   '/api/trips',
   requireAuth,
+  audit('trips'),
   createCrudRouter({
     table: 'trips',
   })
@@ -168,6 +183,7 @@ app.use(
 app.use(
   '/api/boats',
   requireAuth,
+  audit('boats'),
   createCrudRouter({
     table: 'boats',
     jsonFields: ['crew'],
@@ -177,6 +193,7 @@ app.use(
 app.use(
   '/api/cashmovements',
   requireAuth,
+  audit('cashmovements'),
   createCrudRouter({
     table: 'cashmovements',
   })
@@ -185,6 +202,7 @@ app.use(
 app.use(
   '/api/fuelconsumptions',
   requireAuth,
+  audit('fuelconsumptions'),
   createCrudRouter({
     table: 'fuelconsumptions',
   })

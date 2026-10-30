@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { pool } from "../db.js";
+import { auditSafe } from "../audit/auditService.js";
 import { assertAuthSecret, clearSessionCookie, normalizePermissions, requireAuth, setSessionCookie } from "../utils/authSession.js";
 import { hashPassword, verifyPassword } from "../utils/password.js";
 
@@ -53,6 +54,14 @@ router.post("/register", async (request, response) => {
 
     const user = rows[0];
     setSessionCookie(response, user.id);
+    await auditSafe({
+      action: "CREATE",
+      resource: "user",
+      resourceId: user.id,
+      userId: user.id,
+      ip: request.ip,
+      details: { event: "register", email },
+    });
     response.status(201).json({ user: safeUser(user) });
   } catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error
@@ -83,6 +92,14 @@ router.post("/login", async (request, response) => {
     );
     const user = rows[0];
     if (!user || !(await verifyPassword(password, user.password))) {
+      await auditSafe({
+        action: "LOGIN_FAILED",
+        resource: "auth",
+        userId: user?.id ?? null,
+        ip: request.ip,
+        result: "FAILURE",
+        details: { email },
+      });
       response.status(401).json({ error: "Email ou mot de passe incorrect." });
       return;
     }
@@ -92,6 +109,13 @@ router.post("/login", async (request, response) => {
     }
 
     setSessionCookie(response, user.id);
+    await auditSafe({
+      action: "LOGIN",
+      resource: "auth",
+      userId: user.id,
+      ip: request.ip,
+      details: { email },
+    });
     response.json({ user: safeUser(user) });
   } catch (error) {
     console.error("Erreur lors de la connexion", error);
@@ -119,6 +143,14 @@ router.post("/change-password", requireAuth, async (request, response) => {
     }
 
     await pool.query('UPDATE "user" SET password = $1 WHERE id = $2', [await hashPassword(newPassword), user.id]);
+    await auditSafe({
+      action: "UPDATE",
+      resource: "user",
+      resourceId: user.id,
+      userId: user.id,
+      ip: request.ip,
+      details: { event: "change-password" },
+    });
     response.json({ message: "Mot de passe modifié." });
   } catch (error) {
     console.error("Erreur lors du changement de mot de passe", error);
