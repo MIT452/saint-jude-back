@@ -1,7 +1,9 @@
+import { timingSafeEqual } from "node:crypto";
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { pool } from "../db.js";
 import { auditSafe } from "../audit/auditService.js";
+import { roleKey } from "../utils/accessPolicy.js";
 import { assertAuthSecret, clearSessionCookie, normalizePermissions, requireAuth, setSessionCookie } from "../utils/authSession.js";
 import { hashPassword, verifyPassword } from "../utils/password.js";
 
@@ -34,6 +36,42 @@ export function normalizeRegistrationInput(body: unknown) {
   };
 }
 
+/* ---------- Rôle choisi à l'inscription ---------- */
+
+// Rôle technique -> libellé enregistré dans la colonne "role"
+const SELF_SERVICE_ROLES: Record<string, string> = {
+  manager: "Manager",
+  gestionnaire: "Gestionnaire",
+  comptable: "Comptable",
+  caissier: "Caissier",
+  capitaine: "Capitaine",
+};
+
+const sameCode = (a: string, b: string) => {
+  const x = Buffer.from(a);
+  const y = Buffer.from(b);
+  return x.length === y.length && timingSafeEqual(x, y);
+};
+
+/**
+ * Le navigateur ne décide jamais seul de son rôle :
+ *  - Admin / Propriétaire / Directeur : jamais depuis le formulaire ;
+ *  - rôle d'employé : code d'accès propre au rôle (variable ROLE_CODE_<ROLE> sur Render) ;
+ *  - rôle absent ou inconnu : compte « Client » sans droits sur les modules.
+ */
+function resolveRegistrationRole(requested: unknown, roleCode: unknown): { role: string } | { error: string } {
+  const key = roleKey(requested);
+  if (key === "admin") return { error: "Ce rôle ne peut pas être choisi à l'inscription." };
+  const label = SELF_SERVICE_ROLES[key];
+  if (!label) return { role: "Client" };
+
+  const expected = process.env[`ROLE_CODE_${key.toUpperCase()}`]?.trim();
+  const given = typeof roleCode === "string" ? roleCode.trim() : "";
+  // Même message si le code est faux ou non configuré : on ne révèle rien
+  if (!expected || !given || !sameCode(given, expected)) return { error: "Code d'accès invalide pour ce rôle." };
+  return { role: label };
+}
+
 router.post("/register", async (request, response) => {
   const { name, lastName, email, tel, password } = normalizeRegistrationInput(request.body);
 
@@ -42,14 +80,30 @@ router.post("/register", async (request, response) => {
     return;
   }
 
+  const rawBody = request.body && typeof request.body === "object" ? request.body as Record<string, unknown> : {};
+  const resolved = resolveRegistrationRole(rawBody.role, rawBody.roleCode);
+  if ("error" in resolved) {
+    // Compté par la règle de détection (5 essais ratés = alerte critique)
+    await auditSafe({
+      action: "LOGIN_FAILED",
+      resource: "auth",
+      userId: null,
+      ip: request.ip,
+      result: "FAILURE",
+      details: { email, event: "role-code" },
+    });
+    response.status(403).json({ error: resolved.error });
+    return;
+  }
+
   try {
     assertAuthSecret();
     const passwordHash = await hashPassword(password);
     const { rows } = await pool.query<UserRow>(
       `INSERT INTO "user" (id, name, "lastName", password, email, tel, role, permissions)
-       VALUES ($1, $2, $3, $4, $5, $6, 'Agent', '[]'::jsonb)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, '[]'::jsonb)
        RETURNING id, name, "lastName", email, tel, role, permissions, password`,
-      [uuid(), name, lastName, passwordHash, email, tel || null],
+      [uuid(), name, lastName, passwordHash, email, tel || null, resolved.role],
     );
 
     const user = rows[0];
@@ -60,7 +114,7 @@ router.post("/register", async (request, response) => {
       resourceId: user.id,
       userId: user.id,
       ip: request.ip,
-      details: { event: "register", email },
+      details: { event: "register", email, role: resolved.role },
     });
     response.status(201).json({ user: safeUser(user) });
   } catch (error) {
