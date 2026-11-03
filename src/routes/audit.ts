@@ -18,13 +18,16 @@ router.get("/logs", async (request, response) => {
   const resource = typeof request.query.resource === "string" ? request.query.resource : null;
 
   try {
+    // LEFT JOIN : le nom réel de l'utilisateur vient directement de la base (plus de "Inconnu")
     const { rows } = await pool.query(
-      `SELECT id, created_at, user_id, action, resource, resource_id, details,
-              host(ip_address) AS ip_address, result, status
-       FROM audit_logs
-       WHERE ($1::text IS NULL OR status = $1)
-         AND ($2::text IS NULL OR resource = $2)
-       ORDER BY id DESC
+      `SELECT l.id, l.created_at, l.user_id, l.action, l.resource, l.resource_id, l.details,
+              host(l.ip_address) AS ip_address, l.result, l.status,
+              u.name AS user_name, u."lastName" AS user_last_name, u.email AS user_email
+       FROM audit_logs l
+       LEFT JOIN "user" u ON u.id::text = l.user_id::text
+       WHERE ($1::text IS NULL OR l.status = $1)
+         AND ($2::text IS NULL OR l.resource = $2)
+       ORDER BY l.id DESC
        LIMIT $3 OFFSET $4`,
       [status, resource, limit, offset],
     );
