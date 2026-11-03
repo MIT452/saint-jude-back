@@ -38,14 +38,19 @@ export function normalizeRegistrationInput(body: unknown) {
 
 /* ---------- Rôle choisi à l'inscription ---------- */
 
-// Rôle technique -> libellé enregistré dans la colonne "role"
+// Rôle technique -> libellé enregistré dans la colonne "role".
+// Chaque rôle de cette liste exige le code de la variable ROLE_CODE_<ROLE> (Render > Environment).
 const SELF_SERVICE_ROLES: Record<string, string> = {
   manager: "Manager",
   gestionnaire: "Gestionnaire",
   comptable: "Comptable",
   caissier: "Caissier",
   capitaine: "Capitaine",
+  agent: "Agent",
 };
+
+// Rôles qui ne peuvent JAMAIS être obtenus depuis le formulaire d'inscription
+const FORBIDDEN_ROLE_KEYS = new Set(["admin", "administrateur", "owner", "proprietaire", "directeur", "director"]);
 
 const sameCode = (a: string, b: string) => {
   const x = Buffer.from(a);
@@ -53,22 +58,71 @@ const sameCode = (a: string, b: string) => {
   return x.length === y.length && timingSafeEqual(x, y);
 };
 
+// Un code trop court, un texte de remplacement ou un code de démonstration n'est pas un vrai secret
+const isWeakCode = (value: string) =>
+  value.length < 12 ||
+  /^code\s+g[ée]n[ée]r[ée]/i.test(value) ||
+  /^demo[-_]/i.test(value) ||
+  /change.?me|todo|xxx/i.test(value);
+
+/* ---------- Limite de tentatives sur les codes de rôle ---------- */
+
+const WINDOW_MS = 15 * 60 * 1000;
+const MAX_FAILURES_PER_EMAIL = 5;
+const MAX_FAILURES_PER_IP = 20;
+const failures = new Map<string, { count: number; resetAt: number }>();
+
+const purgeExpired = () => {
+  const now = Date.now();
+  for (const [key, value] of failures) {
+    if (value.resetAt <= now) failures.delete(key);
+  }
+};
+
+const failureCount = (key: string) => {
+  const entry = failures.get(key);
+  if (!entry || entry.resetAt <= Date.now()) return 0;
+  return entry.count;
+};
+
+const registerFailure = (key: string) => {
+  if (failures.size > 5000) purgeExpired();
+  const now = Date.now();
+  const entry = failures.get(key);
+  if (!entry || entry.resetAt <= now) failures.set(key, { count: 1, resetAt: now + WINDOW_MS });
+  else entry.count += 1;
+};
+
+const isBlocked = (email: string, ip: string) =>
+  failureCount(`email:${email}`) >= MAX_FAILURES_PER_EMAIL || failureCount(`ip:${ip}`) >= MAX_FAILURES_PER_IP;
+
 /**
  * Le navigateur ne décide jamais seul de son rôle :
  *  - Admin / Propriétaire / Directeur : jamais depuis le formulaire ;
  *  - rôle d'employé : code d'accès propre au rôle (variable ROLE_CODE_<ROLE> sur Render) ;
  *  - rôle absent ou inconnu : compte « Client » sans droits sur les modules.
  */
-function resolveRegistrationRole(requested: unknown, roleCode: unknown): { role: string } | { error: string } {
+function resolveRegistrationRole(requested: unknown, roleCode: unknown): { role: string } | { error: string; codeFailure: boolean } {
   const key = roleKey(requested);
-  if (key === "admin") return { error: "Ce rôle ne peut pas être choisi à l'inscription." };
+  if (FORBIDDEN_ROLE_KEYS.has(key)) {
+    return { error: "Ce rôle ne peut pas être choisi à l'inscription.", codeFailure: false };
+  }
   const label = SELF_SERVICE_ROLES[key];
   if (!label) return { role: "Client" };
 
-  const expected = process.env[`ROLE_CODE_${key.toUpperCase()}`]?.trim();
+  const variable = `ROLE_CODE_${key.toUpperCase()}`;
+  const expected = process.env[variable]?.trim();
   const given = typeof roleCode === "string" ? roleCode.trim() : "";
-  // Même message si le code est faux ou non configuré : on ne révèle rien
-  if (!expected || !given || !sameCode(given, expected)) return { error: "Code d'accès invalide pour ce rôle." };
+
+  if (!expected || isWeakCode(expected)) {
+    // Visible uniquement dans les logs Render : le code du rôle n'est pas configuré correctement
+    console.warn(`[register] ${variable} est absent ou trop faible : inscription refusée pour ce rôle.`);
+    return { error: "Code d'accès invalide pour ce rôle.", codeFailure: true };
+  }
+  // Même message si le code est faux ou absent : on ne révèle rien
+  if (!given || !sameCode(given, expected)) {
+    return { error: "Code d'accès invalide pour ce rôle.", codeFailure: true };
+  }
   return { role: label };
 }
 
@@ -81,8 +135,20 @@ router.post("/register", async (request, response) => {
   }
 
   const rawBody = request.body && typeof request.body === "object" ? request.body as Record<string, unknown> : {};
+  const ip = request.ip ?? "unknown";
+
+  // Trop d'essais ratés de code de rôle : on bloque temporairement (les inscriptions « Client » restent possibles)
+  if (SELF_SERVICE_ROLES[roleKey(rawBody.role)] && isBlocked(email, ip)) {
+    response.status(429).json({ error: "Trop de tentatives. Réessayez dans quelques minutes." });
+    return;
+  }
+
   const resolved = resolveRegistrationRole(rawBody.role, rawBody.roleCode);
   if ("error" in resolved) {
+    if (resolved.codeFailure) {
+      registerFailure(`email:${email}`);
+      registerFailure(`ip:${ip}`);
+    }
     // Compté par la règle de détection (5 essais ratés = alerte critique)
     await auditSafe({
       action: "LOGIN_FAILED",
