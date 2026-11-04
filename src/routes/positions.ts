@@ -3,6 +3,10 @@ import { v4 as uuid } from 'uuid';
 import { pool } from '../db.js';
 import { emitPosition } from '../realtime.js';
 
+export function buildLatestPositionResponse(rows: Array<Record<string, unknown>> | []) {
+  return rows.length === 0 ? null : rows[0];
+}
+
 export const positionsRouter = Router();
 
 positionsRouter.post('/', async (req, res) => {
@@ -28,6 +32,31 @@ positionsRouter.post('/', async (req, res) => {
   }
 });
 
+// Dernière position de plusieurs bateaux en UN seul appel : un bateau sans position est
+// simplement absent de la réponse (pas de 404 répétés dans la console du navigateur).
+// À déclarer avant '/:boatId/latest'.
+positionsRouter.get('/latest', async (req, res) => {
+  const ids = String(req.query.boatIds ?? '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean)
+    .slice(0, 50);
+  if (ids.length === 0) return res.json([]);
+  try {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT ON ("boatId") "boatId", latitude::float AS latitude, longitude::float AS longitude,
+              speed::float AS speed, "createdAt"
+       FROM positions WHERE "boatId" = ANY($1::text[])
+       ORDER BY "boatId", "createdAt" DESC`,
+      [ids]
+    );
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erreur lors de la lecture' });
+  }
+});
+
 positionsRouter.get('/:boatId/latest', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -35,8 +64,8 @@ positionsRouter.get('/:boatId/latest', async (req, res) => {
        FROM positions WHERE "boatId" = $1 ORDER BY "createdAt" DESC LIMIT 1`,
       [req.params.boatId]
     );
-    if (rows.length === 0) return res.status(404).json({ error: 'Aucune position' });
-    res.json(rows[0]);
+
+    res.json(buildLatestPositionResponse(rows));
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erreur lors de la lecture' });
