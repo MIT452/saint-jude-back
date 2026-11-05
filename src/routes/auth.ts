@@ -65,11 +65,19 @@ const isWeakCode = (value: string) =>
   /^demo[-_]/i.test(value) ||
   /change.?me|todo|xxx/i.test(value);
 
-/* ---------- Limite de tentatives sur les codes de rôle ---------- */
+// Même règle de mot de passe que le formulaire d'inscription (le navigateur ne suffit jamais)
+const isStrongPassword = (p: string) =>
+  p.length >= 8 && p.length <= 128 && /[A-Z]/.test(p) && /[a-z]/.test(p) && /\d/.test(p) && /[^A-Za-z0-9]/.test(p);
+
+/* ---------- Limite de tentatives (codes de rôle et connexion) ---------- */
 
 const WINDOW_MS = 15 * 60 * 1000;
 const MAX_FAILURES_PER_EMAIL = 5;
 const MAX_FAILURES_PER_IP = 20;
+// Connexion : clé = IP + e-mail, pour qu'un attaquant ne puisse pas bloquer le compte d'un autre utilisateur depuis sa propre IP
+const MAX_LOGIN_FAILURES_PER_PAIR = 5;
+const MAX_LOGIN_FAILURES_PER_IP = 30;
+// Compteurs en mémoire : remis à zéro au redémarrage de Render (suffisant pour une seule instance)
 const failures = new Map<string, { count: number; resetAt: number }>();
 
 const purgeExpired = () => {
@@ -95,6 +103,14 @@ const registerFailure = (key: string) => {
 
 const isBlocked = (email: string, ip: string) =>
   failureCount(`email:${email}`) >= MAX_FAILURES_PER_EMAIL || failureCount(`ip:${ip}`) >= MAX_FAILURES_PER_IP;
+
+const isLoginBlocked = (email: string, ip: string) =>
+  failureCount(`login:${ip}:${email}`) >= MAX_LOGIN_FAILURES_PER_PAIR || failureCount(`loginip:${ip}`) >= MAX_LOGIN_FAILURES_PER_IP;
+
+const registerLoginFailure = (email: string, ip: string) => {
+  registerFailure(`login:${ip}:${email}`);
+  registerFailure(`loginip:${ip}`);
+};
 
 /**
  * Le navigateur ne décide jamais seul de son rôle :
@@ -131,6 +147,12 @@ router.post("/register", async (request, response) => {
 
   if (!name || !lastName || !/^\S+@\S+\.\S+$/.test(email) || password.length < 8 || password.length > 128) {
     response.status(400).json({ error: "Nom, prénom, email valide et mot de passe de 8 à 128 caractères requis." });
+    return;
+  }
+  if (!isStrongPassword(password)) {
+    response.status(400).json({
+      error: "Le mot de passe doit contenir une majuscule, une minuscule, un chiffre et un caractère spécial.",
+    });
     return;
   }
 
@@ -204,6 +226,13 @@ router.post("/login", async (request, response) => {
     return;
   }
 
+  const ip = request.ip ?? "unknown";
+  // Après 5 échecs (même IP + même e-mail) ou 30 échecs (même IP) en 15 min : pause
+  if (isLoginBlocked(email, ip)) {
+    response.status(429).json({ error: "Trop de tentatives. Réessayez dans quelques minutes." });
+    return;
+  }
+
   try {
     assertAuthSecret();
     const { rows } = await pool.query<UserRow>(
@@ -212,6 +241,7 @@ router.post("/login", async (request, response) => {
     );
     const user = rows[0];
     if (!user || !(await verifyPassword(password, user.password))) {
+      registerLoginFailure(email, ip);
       await auditSafe({
         action: "LOGIN_FAILED",
         resource: "auth",
@@ -223,6 +253,9 @@ router.post("/login", async (request, response) => {
       response.status(401).json({ error: "Email ou mot de passe incorrect." });
       return;
     }
+
+    // Connexion réussie : on remet à zéro le compteur de cette IP + e-mail
+    failures.delete(`login:${ip}:${email}`);
 
     if (!user.password.startsWith("scrypt$")) {
       await pool.query('UPDATE "user" SET password = $1 WHERE id = $2', [await hashPassword(password), user.id]);

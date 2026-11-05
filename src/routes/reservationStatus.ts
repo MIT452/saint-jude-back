@@ -1,13 +1,15 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { pool } from '../db.js';
-import { notifyN8n } from '../services/notify.js';
+import { flushOutbox } from './ai.js';
+import { notificationsEnabled } from '../services/notifications.js';
 
 const router = Router();
 
 // Valeurs autorisées par la contrainte chk_reservation_status de la base
 const statusSchema = z.object({
   status: z.enum(['EN_ATTENTE', 'CONFIRMEE', 'REFUSEE', 'ANNULEE', 'NO_SHOW', 'TERMINEE']),
+  reason: z.string().trim().max(300).optional(), // motif (utile pour un refus)
 });
 
 // Transitions autorisées (ANNULEE, REFUSEE, NO_SHOW, TERMINEE sont des états finaux)
@@ -43,6 +45,60 @@ async function recordReservationEvent(
     );
   } catch (error) {
     console.error('Historique de réservation non enregistré:', error);
+  }
+}
+
+// Notification : écrite dans l'outbox puis envoyée (e-mail / WhatsApp / n8n).
+// En "meilleur effort" : une erreur ici ne casse jamais le changement de statut.
+async function queueNotification(
+  eventType: string,
+  reservationId: string,
+  userId: string | null,
+  motif?: string,
+) {
+  if (!notificationsEnabled()) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT r."clientName" AS client_nom, r.quantity AS quantite, r.weight::float AS poids_kg,
+              r."totalPrice"::float AS total,
+              t."from" AS depart, t."to" AS arrivee,
+              to_char(t.depart::date, 'YYYY-MM-DD') AS date,
+              b.name AS navire
+       FROM reservations r
+       LEFT JOIN trips t ON t.id = r."tripId"
+       LEFT JOIN boats b ON b.id = t."boatId"
+       WHERE r.id = $1`,
+      [reservationId],
+    );
+
+    // Contact du client : requête séparée, si elle échoue on notifie quand même l'admin
+    let contact: { email?: string; tel?: string } = {};
+    if (userId) {
+      try {
+        const u = await pool.query(`SELECT email, tel FROM "user" WHERE id = $1`, [userId]);
+        contact = { email: u.rows[0]?.email ?? undefined, tel: u.rows[0]?.tel ?? undefined };
+      } catch (err) {
+        console.warn('Contact client introuvable (colonnes "user" ?) :', err);
+      }
+    }
+
+    const payload = {
+      numero: reservationId.slice(0, 8),
+      ...(rows[0] ?? {}),
+      email: contact.email ?? '',
+      telephone: contact.tel ?? '',
+      motif: motif ?? '',
+    };
+
+    await pool.query(
+      `INSERT INTO notification_outbox (event, reservation_id, payload)
+       VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (event, reservation_id) DO NOTHING`,
+      [eventType, reservationId, JSON.stringify(payload)],
+    );
+    void flushOutbox(); // sans attendre : une lenteur d'envoi ne retarde pas la réponse
+  } catch (error) {
+    console.error('Notification non mise en file:', error);
   }
 }
 
@@ -90,6 +146,7 @@ router.patch('/:id/status', async (req: Request, res: Response) => {
   }
 
   const nextStatus = parsed.data.status;
+  const reason = parsed.data.reason;
   const reservationId = req.params.id;
 
   try {
@@ -130,24 +187,19 @@ router.patch('/:id/status', async (req: Request, res: Response) => {
 
     const eventType = EVENT_BY_STATUS[nextStatus];
     if (eventType) {
-      const updatedBy = res.locals.sessionUser?.id ?? null;
-      const eventData = {
+      await recordReservationEvent(reservationId, eventType, {
         reservationId,
         previousStatus: currentStatus,
         nextStatus,
         userId,
         tripId,
         totalPrice,
-        updatedBy,
-      };
-
-      await recordReservationEvent(reservationId, eventType, {
-        ...eventData,
+        reason: reason ?? null,
+        updatedBy: res.locals.sessionUser?.id ?? null,
         updatedAt: new Date().toISOString(),
       });
 
-      // Pas de await : une lenteur de n8n ne doit pas retarder la réponse
-      void notifyN8n(eventType, eventData);
+      await queueNotification(eventType, reservationId, userId ?? null, reason);
     }
 
     return res.json({ id: rows[0].id, status: rows[0].status });

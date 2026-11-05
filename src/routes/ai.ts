@@ -5,6 +5,11 @@ import { financeRouter } from './aiFinance.js';
 import { SYSTEM_PROMPT, GENERAL_PROMPT, sanitizeLLMReply, dateReply } from '../ai/prompts.js';
 import { humanize } from '../ai/humanize.js';
 import { createAgentRouter } from './agentRouter.js';
+import {
+  deliverNotification,
+  emailEnabled,
+  notificationsEnabled,
+} from '../services/notifications.js';
 
 export const aiRouter = Router();
 
@@ -196,13 +201,13 @@ const USED_SQL = `COALESCE((SELECT SUM(r.quantity) FROM reservations r
                     WHERE r."tripId" = t.id
                       AND UPPER(COALESCE(r.status, '')) NOT IN
                         ('REFUSEE', 'REFUSÉE', 'ANNULEE', 'ANNULÉE', 'CANCELLED', 'NO_SHOW', 'NO-SHOW')), 0)`;
-
 export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<VerifyResult> {
   if (i.date < todayLocal()) {
     return { available: false, message: 'La date demandée est déjà passée.' };
   }
 
   const params = [likeParam(i.depart), likeParam(i.arrivee), i.date];
+  const NOT_MAINTENANCE = `(b.id IS NULL OR LOWER(COALESCE(b.state, '')) NOT LIKE '%maintenance%')`;
 
   const { rows: allRows } = await db.query(
     `SELECT t.id, t."pricePerKg" AS price_per_kg, t."boatId" AS boat_id, t."from" AS trip_from, t."to" AS trip_to,
@@ -210,24 +215,51 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
-       AND (b.id IS NULL OR LOWER(COALESCE(b.state, '')) NOT LIKE '%maintenance%')
+       AND ${NOT_MAINTENANCE}
      ORDER BY t.depart ASC`,
     params,
   );
   const rows = i.tripId ? allRows.filter((r) => String(r.id) === String(i.tripId)) : allRows;
 
   if (rows.length === 0) {
+    // Aucun voyage ce jour-là : on propose les 3 prochains départs (navire + tarif)
     const next = await db.query(
-      `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day
+      `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day, b.name AS boat_name, t."pricePerKg" AS price_per_kg
        FROM trips t
-       WHERE ${TRIP_FILTER} AND t.depart::date > $3::date
-       ORDER BY t.depart ASC LIMIT 1`,
+       LEFT JOIN boats b ON t."boatId" = b.id
+       WHERE ${TRIP_FILTER} AND t.depart::date > $3::date AND ${NOT_MAINTENANCE}
+       ORDER BY t.depart ASC LIMIT 3`,
       params,
+    );
+    if (next.rows.length > 0) {
+      const list = next.rows.map((r) => {
+        const info = [
+          r.boat_name ? `navire ${r.boat_name}` : '',
+          Number(r.price_per_kg) > 0 ? `${Number(r.price_per_kg).toLocaleString('fr-FR')} Ar/kg` : '',
+        ]
+          .filter(Boolean)
+          .join(', ');
+        return `le ${formatFr(r.day)}${info ? ` (${info})` : ''}`;
+      });
+      return {
+        available: false,
+        message: `Aucun voyage entre ${i.depart} et ${i.arrivee} le ${formatFr(i.date)}. ${
+          list.length > 1 ? 'Prochains départs' : 'Prochain départ'
+        } : ${list.join(', ')}.`,
+      };
+    }
+
+    // Aucun départ à venir sur ce trajet : on indique ce qui est desservi depuis ce port
+    const other = await db.query(
+      `SELECT DISTINCT t."to" AS dest FROM trips t
+       WHERE LOWER(t."from") LIKE $1 ESCAPE '\\' AND ${TRIP_ACTIVE} AND t.depart::date >= $2::date
+       LIMIT 5`,
+      [params[0], todayLocal()],
     );
     return {
       available: false,
-      message: next.rows[0]
-        ? `Aucun voyage entre ${i.depart} et ${i.arrivee} le ${formatFr(i.date)}. Le prochain départ est le ${formatFr(next.rows[0].day)}.`
+      message: other.rows.length
+        ? `Aucun voyage trouvé entre ${i.depart} et ${i.arrivee}. Depuis ${i.depart}, les destinations desservies sont : ${other.rows.map((r) => r.dest).join(', ')}.`
         : `Aucun voyage trouvé entre ${i.depart} et ${i.arrivee}.`,
     };
   }
@@ -885,11 +917,9 @@ async function ensureOutboxTable() {
   );
   outboxReady = true;
 }
-
 let flushing = false;
 export async function flushOutbox() {
-  const url = n8nUrl();
-  if (!url || flushing) return;
+  if (!notificationsEnabled() || flushing) return;
   flushing = true;
   try {
     await ensureOutboxTable();
@@ -899,16 +929,31 @@ export async function flushOutbox() {
     );
     for (const r of rows) {
       try {
-        const res = await fetch(url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Webhook-Secret': (process.env.N8N_WEBHOOK_SECRET ?? '').trim(),
-          },
-          body: JSON.stringify({ notification_id: r.id, event: r.event, ...r.payload }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!res.ok) throw new Error(`n8n ${res.status}`);
+        const url = n8nUrl();
+        if (url) {
+          // n8n configuré : envoi vers le webhook
+          const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Webhook-Secret': (process.env.N8N_WEBHOOK_SECRET ?? '').trim(),
+            },
+            body: JSON.stringify({ notification_id: r.id, event: r.event, ...r.payload }),
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!res.ok) throw new Error(`n8n ${res.status}`);
+        } else {
+          // Envoi direct (e-mail / WhatsApp) : les cibles déjà livrées sont mémorisées
+          const done: string[] = Array.isArray(r.payload?._done) ? r.payload._done : [];
+          const out = await deliverNotification(r.event, r.payload, done);
+          if (out.failed.length) {
+            await defaultDb.query(
+              `UPDATE notification_outbox SET payload = payload || $2::jsonb WHERE id = $1`,
+              [r.id, JSON.stringify({ _done: [...done, ...out.sent] })],
+            );
+            throw new Error(`non envoyé : ${out.failed.join(', ')}`);
+          }
+        }
         await defaultDb.query(`UPDATE notification_outbox SET sent_at = now() WHERE id = $1`, [r.id]);
       } catch (err) {
         console.warn(`[IA] notification ${r.id} non envoyée : ${safeError(err)}`);
@@ -920,6 +965,11 @@ export async function flushOutbox() {
   } finally {
     flushing = false;
   }
+}
+
+// Reprise des envois en échec (l'instance gratuite de Render se met en veille)
+if (notificationsEnabled()) {
+  setInterval(() => void flushOutbox(), 60_000).unref?.();
 }
 
 // Reprise des envois en échec (l'instance gratuite de Render se met en veille)
@@ -1102,7 +1152,7 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
       sample: out.trim().slice(0, 20),
       keys,
       humanize: process.env.AI_HUMANIZE === '1',
-      notifications: Boolean(n8nUrl()),
+      notifications: notificationsEnabled(),
       confirmedStatus: confirmedStatusCache,
     });
   } catch (error) {
@@ -1205,8 +1255,8 @@ export function confirmationMessage(o: {
     ? `Votre réservation ${ref} est confirmée. Montant à payer : ${amount}.`
     : `Votre réservation a été enregistrée sous le numéro ${ref} avec le statut « En attente ». Montant à payer : ${amount}.`;
   // On n'annonce l'e-mail que s'il peut vraiment partir (n8n actif et adresse connue)
-  const mail = n8nUrl() && o.reservation?.clientEmail ? ' Un e-mail de confirmation vous est envoyé.' : '';
-  return `${base} Retrouvez-la dans le Tableau des réservations.${mail}`;
+  const mail = (n8nUrl() || emailEnabled()) && o.reservation?.clientEmail ? ' Un e-mail de confirmation vous est envoyé.' : '';
+  return `${base}${mail}`;
 }
 
 export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): Promise<ReserveOutcome> {
@@ -1216,7 +1266,7 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
   // Préparations hors transaction (lecture du statut autorisé, table de notifications)
   const status = await getConfirmedStatus();
   const confirmed = status !== STATUS_PENDING;
-  const notify = Boolean(n8nUrl());
+  const notify = notificationsEnabled();
   if (notify) await ensureOutboxTable().catch((err) => console.warn(`[IA] outbox : ${safeError(err)}`));
 
   const client = await pool.connect();
