@@ -9,6 +9,7 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import { runAgent, type AgentDeps } from '../ai/agent.js';
 import { claimPending, loadConv, publicPending, saveConv } from '../ai/state.js';
+import { emailEnabled } from '../services/notifications.js';
 import type { ReserveInput, ReserveOutcome, SessionUserLite } from './ai.js';
 
 interface Deps extends AgentDeps {
@@ -24,13 +25,22 @@ const userIdOf = (res: Response): string | null => {
 /**
  * Message de retour fidèle au statut réellement enregistré par reserveTrip :
  * « confirmée » si la contrainte de la base accepte ce statut, « En attente » sinon.
+ * La phrase sur l'e-mail n'apparaît que si l'envoi est possible et l'adresse connue.
  */
-const confirmationReply = (o: { id: string; price: number; confirmed: boolean }): string => {
+const confirmationReply = (o: {
+  id: string;
+  price: number;
+  confirmed: boolean;
+  reservation?: { clientEmail?: string };
+}): string => {
   const ref = `#${o.id.slice(0, 8)}`;
   const amount = `${o.price.toLocaleString('fr-FR')} Ar`;
-  return o.confirmed
+  const base = o.confirmed
     ? `Votre réservation ${ref} est confirmée. Montant à payer : ${amount}.`
     : `Votre réservation a été enregistrée sous le numéro ${ref} avec le statut « En attente ». Montant à payer : ${amount}.`;
+  const canMail = Boolean((process.env.N8N_WEBHOOK_URL ?? '').trim()) || emailEnabled();
+  const mail = canMail && o.reservation?.clientEmail ? ' Un e-mail de confirmation vous est envoyé.' : '';
+  return `${base}${mail}`;
 };
 
 export function createAgentRouter(deps: Deps) {

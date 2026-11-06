@@ -1,6 +1,12 @@
 // src/services/notifications.ts
 // Envoi direct des notifications : e-mail (Brevo) et WhatsApp (API Cloud de Meta).
 // Utilisé par flushOutbox (ai.ts) quand N8N_WEBHOOK_URL n'est pas défini.
+//  - Client : coordonnées du compte propriétaire de la réservation (payload.email / payload.telephone,
+//    lus dans Neon par requireAuth).
+//  - Administrateur : coordonnées de la table notification_settings (page « Configuration »),
+//    avec repli sur ADMIN_EMAIL / ADMIN_WHATSAPP si rien n'est configuré.
+
+import { pool } from '../db.js';
 
 type Payload = Record<string, any>;
 type Msg = { subject: string; text: string };
@@ -135,28 +141,138 @@ async function sendWhatsApp(to: string, p: Payload) {
   if (!res.ok) throw new Error(`WhatsApp ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
+/* =========================================================
+   Paramètres de notification de l'administrateur (table notification_settings)
+========================================================= */
+interface SettingsRow {
+  user_id: string;
+  whatsapp_number: string | null;
+  email_address: string | null;
+  whatsapp_enabled: boolean | null;
+  email_enabled: boolean | null;
+  client_whatsapp_enabled: boolean | null;
+  client_email_enabled: boolean | null;
+  events: unknown;
+}
+
+// Événements du système → événements cochés dans la page « Configuration »
+const SETTINGS_EVENT: Record<string, string> = {
+  'reservation.confirmed': 'reservation.auto_approved',
+  'reservation.pending': 'reservation.manual_review',
+  'reservation.refused': 'reservation.rejected',
+};
+
+function eventAllowed(row: SettingsRow, event: string): boolean {
+  const mapped = SETTINGS_EVENT[event];
+  if (!mapped) return true;
+  let list: unknown = row.events;
+  if (typeof list === 'string') {
+    try {
+      list = JSON.parse(list);
+    } catch {
+      list = null;
+    }
+  }
+  if (!Array.isArray(list)) return true;
+  return list.includes(mapped);
+}
+
+/** null = table illisible (on se rabat sur les variables d'environnement). */
+async function loadSettings(): Promise<SettingsRow[] | null> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT user_id, whatsapp_number, email_address, whatsapp_enabled, email_enabled,
+              client_whatsapp_enabled, client_email_enabled, events
+         FROM notification_settings`,
+    );
+    return rows as SettingsRow[];
+  } catch (err) {
+    console.warn(`[notif] notification_settings illisible : ${err instanceof Error ? err.message : String(err)}`);
+    return null;
+  }
+}
+
+/** Historique visible dans la page Configuration ; ne doit jamais faire échouer l'envoi. */
+async function logSend(
+  userId: string,
+  channel: 'email' | 'whatsapp',
+  event: string,
+  recipient: string,
+  error: string | null,
+) {
+  try {
+    await pool.query(
+      `INSERT INTO notification_logs (user_id, channel, event, recipient, status, error)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [userId, channel, event, recipient, error ? 'failed' : 'sent', error],
+    );
+  } catch {
+    /* journal facultatif */
+  }
+}
+
+interface Job {
+  key: string;
+  run: () => Promise<void>;
+  log?: { userId: string; channel: 'email' | 'whatsapp'; to: string };
+}
+
 /**
  * Envoie les messages d'un événement. `already` = cibles déjà livrées (évite les doublons
  * quand une nouvelle tentative a lieu). Un destinataire sans adresse est simplement ignoré.
  */
 export async function deliverNotification(event: string, p: Payload, already: string[] = []) {
   const msgs = buildMessages(event, p);
-  const jobs: Array<{ key: string; run: () => Promise<void> }> = [];
+  const jobs: Job[] = [];
 
-  const adminMail = env('ADMIN_EMAIL');
-  const adminWa = normalizePhone(env('ADMIN_WHATSAPP'));
-  const clientMail = typeof p.email === 'string' ? p.email.trim() : '';
-  const clientWa = normalizePhone(p.telephone);
+  const settings = await loadSettings();
+  const configured = settings !== null && settings.length > 0;
 
+  // ---- Administrateur
   if (msgs.admin) {
     const m = msgs.admin;
-    if (emailEnabled() && adminMail) jobs.push({ key: 'admin:email', run: () => sendEmail(adminMail, m) });
-    if (whatsappEnabled() && adminWa) jobs.push({ key: 'admin:whatsapp', run: () => sendWhatsApp(adminWa, p) });
+    if (configured) {
+      for (const row of settings!) {
+        if (!eventAllowed(row, event)) continue;
+        const mail = (row.email_address ?? '').trim();
+        const wa = normalizePhone(row.whatsapp_number);
+        if (row.email_enabled && mail && emailEnabled()) {
+          jobs.push({
+            key: `admin:${row.user_id}:email`,
+            run: () => sendEmail(mail, m),
+            log: { userId: row.user_id, channel: 'email', to: mail },
+          });
+        }
+        if (row.whatsapp_enabled && wa && whatsappEnabled()) {
+          jobs.push({
+            key: `admin:${row.user_id}:whatsapp`,
+            run: () => sendWhatsApp(wa, p),
+            log: { userId: row.user_id, channel: 'whatsapp', to: wa },
+          });
+        }
+      }
+    } else {
+      // Repli : rien n'est configuré dans la page, on utilise les variables Render
+      const adminMail = env('ADMIN_EMAIL');
+      const adminWa = normalizePhone(env('ADMIN_WHATSAPP'));
+      if (emailEnabled() && adminMail) jobs.push({ key: 'admin:email', run: () => sendEmail(adminMail, m) });
+      if (whatsappEnabled() && adminWa) jobs.push({ key: 'admin:whatsapp', run: () => sendWhatsApp(adminWa, p) });
+    }
   }
+
+  // ---- Client : coordonnées de son propre compte uniquement
   if (msgs.client) {
     const m = msgs.client;
-    if (emailEnabled() && clientMail) jobs.push({ key: 'client:email', run: () => sendEmail(clientMail, m) });
-    if (whatsappEnabled() && clientWa) jobs.push({ key: 'client:whatsapp', run: () => sendWhatsApp(clientWa, p) });
+    const clientMail = typeof p.email === 'string' ? p.email.trim() : '';
+    const clientWa = normalizePhone(p.telephone);
+    const emailAllowed = !configured || settings!.some((r) => r.client_email_enabled !== false);
+    const waAllowed = !configured || settings!.some((r) => r.client_whatsapp_enabled !== false);
+    if (emailAllowed && emailEnabled() && clientMail) {
+      jobs.push({ key: 'client:email', run: () => sendEmail(clientMail, m) });
+    }
+    if (waAllowed && whatsappEnabled() && clientWa) {
+      jobs.push({ key: 'client:whatsapp', run: () => sendWhatsApp(clientWa, p) });
+    }
   }
 
   const sent: string[] = [];
@@ -166,9 +282,12 @@ export async function deliverNotification(event: string, p: Payload, already: st
     try {
       await job.run();
       sent.push(job.key);
+      if (job.log) await logSend(job.log.userId, job.log.channel, event, job.log.to, null);
     } catch (err) {
-      console.warn(`[notif] ${job.key} échoué : ${err instanceof Error ? err.message : String(err)}`);
+      const reason = err instanceof Error ? err.message : String(err);
+      console.warn(`[notif] ${job.key} échoué : ${reason}`);
       failed.push(job.key);
+      if (job.log) await logSend(job.log.userId, job.log.channel, event, job.log.to, reason.slice(0, 200));
     }
   }
   return { sent, failed };
