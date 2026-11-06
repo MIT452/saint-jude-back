@@ -15,7 +15,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-10-23-confirm-immediate';
+const BUILD = 'ai-2026-11-06-boat-usable';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -191,6 +191,15 @@ const TRIP_ACTIVE = `UPPER(COALESCE(t.status, '')) NOT LIKE 'ANNUL%'`;
 
 const TRIP_FILTER = `LOWER(t."from") LIKE $1 ESCAPE '\\' AND LOWER(t."to") LIKE $2 ESCAPE '\\' AND ${TRIP_ACTIVE}`;
 
+// Bateau utilisable : ni en maintenance, ni hors service, ni désarmé, ni en construction
+const BOAT_USABLE = `(b.id IS NULL OR (
+  LOWER(COALESCE(b.state, '')) NOT LIKE '%maintenance%'
+  AND LOWER(COALESCE(b.state, '')) NOT LIKE '%hors%'
+  AND LOWER(COALESCE(b.state, '')) NOT LIKE '%désarm%'
+  AND LOWER(COALESCE(b.state, '')) NOT LIKE '%desarm%'
+  AND LOWER(COALESCE(b.state, '')) NOT LIKE '%construction%'
+))`;
+
 // reservations."paymentStatus" est un booléen (affiché f / t) : false = non payé
 const PAYMENT_STATUS_INIT = false;
 
@@ -207,7 +216,6 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
   }
 
   const params = [likeParam(i.depart), likeParam(i.arrivee), i.date];
-  const NOT_MAINTENANCE = `(b.id IS NULL OR LOWER(COALESCE(b.state, '')) NOT LIKE '%maintenance%')`;
 
   const { rows: allRows } = await db.query(
     `SELECT t.id, t."pricePerKg" AS price_per_kg, t."boatId" AS boat_id, t."from" AS trip_from, t."to" AS trip_to,
@@ -215,7 +223,7 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
      FROM trips t
      LEFT JOIN boats b ON t."boatId" = b.id
      WHERE ${TRIP_FILTER} AND t.depart::date = $3::date
-       AND ${NOT_MAINTENANCE}
+       AND ${BOAT_USABLE}
      ORDER BY t.depart ASC`,
     params,
   );
@@ -227,7 +235,7 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
       `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day, b.name AS boat_name, t."pricePerKg" AS price_per_kg
        FROM trips t
        LEFT JOIN boats b ON t."boatId" = b.id
-       WHERE ${TRIP_FILTER} AND t.depart::date > $3::date AND ${NOT_MAINTENANCE}
+       WHERE ${TRIP_FILTER} AND t.depart::date > $3::date AND ${BOAT_USABLE}
        ORDER BY t.depart ASC LIMIT 3`,
       params,
     );
@@ -249,18 +257,39 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
       };
     }
 
-    // Aucun départ à venir sur ce trajet : on indique ce qui est desservi depuis ce port
+    // Aucun départ à venir sur ce trajet : destinations desservies depuis ce port
     const other = await db.query(
       `SELECT DISTINCT t."to" AS dest FROM trips t
+       LEFT JOIN boats b ON t."boatId" = b.id
        WHERE LOWER(t."from") LIKE $1 ESCAPE '\\' AND ${TRIP_ACTIVE} AND t.depart::date >= $2::date
+         AND ${BOAT_USABLE}
        LIMIT 5`,
       [params[0], todayLocal()],
     );
+    if (other.rows.length > 0) {
+      return {
+        available: false,
+        message: `Aucun voyage trouvé entre ${i.depart} et ${i.arrivee}. Depuis ${i.depart}, les destinations desservies sont : ${other.rows.map((r) => r.dest).join(', ')}.`,
+      };
+    }
+
+    // Rien depuis ce port : on indique les prochains départs de tout le réseau
+    const network = await db.query(
+      `SELECT to_char(t.depart::date, 'YYYY-MM-DD') AS day, t."from" AS dep, t."to" AS dest
+       FROM trips t
+       LEFT JOIN boats b ON t."boatId" = b.id
+       WHERE ${TRIP_ACTIVE} AND t.depart::date >= $1::date AND ${BOAT_USABLE}
+       ORDER BY t.depart ASC LIMIT 3`,
+      [todayLocal()],
+    );
+    const base = `Aucun voyage à venir n’est programmé entre ${i.depart} et ${i.arrivee}, ni au départ de ${i.depart}.`;
+    if (network.rows.length === 0) {
+      return { available: false, message: `${base} Aucun autre voyage n’est programmé pour le moment.` };
+    }
+    const list = network.rows.map((r) => `${r.dep} → ${r.dest} le ${formatFr(r.day)}`).join(' ; ');
     return {
       available: false,
-      message: other.rows.length
-        ? `Aucun voyage trouvé entre ${i.depart} et ${i.arrivee}. Depuis ${i.depart}, les destinations desservies sont : ${other.rows.map((r) => r.dest).join(', ')}.`
-        : `Aucun voyage trouvé entre ${i.depart} et ${i.arrivee}.`,
+      message: `${base} Prochains départs sur nos autres lignes : ${list}.`,
     };
   }
 
