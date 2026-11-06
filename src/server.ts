@@ -29,6 +29,7 @@ import { audit } from './audit/auditMiddleware.js'; // AJOUT AUDIT 1/3
 import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
 import { access } from './utils/accessPolicy.js'; // AJOUT DROITS
 import accessRouter from './routes/access.js'; // AJOUT DROITS : /api/access/me
+import boatsAvailableRouter from './routes/boatsAvailable.js'; // AJOUT BATEAUX LECTURE SEULE
 
 const app = express();
 
@@ -193,6 +194,12 @@ app.use(
     table: 'trips',
   })
 );
+
+/*
+ * Bateaux en lecture seule (champs publics) : accessible à tout compte connecté.
+ * Doit rester AVANT '/api/boats', sinon access('boats') le bloque pour un client.
+ */
+app.use('/api/boats/available', requireAuth, boatsAvailableRouter);
 
 app.use(
   '/api/boats',
