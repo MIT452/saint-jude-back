@@ -20,6 +20,7 @@ import advancedAiRouter from './routes/advanced-ai.js';
 import { initRealtime } from './realtime.js';
 import { traceRequest } from './ai/observability.js';
 import authRouter from './routes/auth.js';
+import notificationSettingsRouter from './routes/notificationSettings.js';
 import { requireAuth, requireOwner, requireTrustedOrigin } from './utils/authSession.js';
 import { pool } from './db.js';
 import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
@@ -93,6 +94,7 @@ app.get('/api/health/database', async (_req, res) => {
 app.get('/metrics', metricsHandler); // AJOUT AIOPS 3/3
 
 app.use('/api/auth', authRouter);
+app.use('/api/notification-settings', requireAuth, notificationSettingsRouter);
 
 /* =========================
    JOURNAL D'AUDIT (lecture, vérification, revue des alertes)
