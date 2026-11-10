@@ -13,9 +13,16 @@ type Msg = { subject: string; text: string };
 
 const env = (k: string) => (process.env[k] ?? '').trim();
 
+/** Jeton WhatsApp nettoyé : retire guillemets, espaces et préfixe « Bearer » collés par erreur. */
+const whatsappToken = () =>
+  env('WHATSAPP_TOKEN')
+    .replace(/^["']+|["']+$/g, '')
+    .replace(/^Bearer\s+/i, '')
+    .trim();
+
 export const emailEnabled = () => Boolean(env('BREVO_API_KEY') && env('MAIL_FROM'));
 export const whatsappEnabled = () =>
-  Boolean(env('WHATSAPP_TOKEN') && env('WHATSAPP_PHONE_NUMBER_ID'));
+  Boolean(whatsappToken() && env('WHATSAPP_PHONE_NUMBER_ID'));
 export const directNotificationsEnabled = () => emailEnabled() || whatsappEnabled();
 export const notificationsEnabled = () => Boolean(env('N8N_WEBHOOK_URL')) || directNotificationsEnabled();
 
@@ -114,6 +121,32 @@ async function sendEmail(to: string, m: Msg, senderName?: string | null) {
   if (!res.ok) throw new Error(`Brevo ${res.status}: ${(await res.text()).slice(0, 150)}`);
 }
 
+/** Transforme une erreur Meta (JSON brut) en message lisible, sans jamais afficher le jeton. */
+function explainWhatsAppError(status: number, body: string): string {
+  let code: number | undefined;
+  let msg = '';
+  try {
+    const j = JSON.parse(body);
+    code = j?.error?.code;
+    msg = String(j?.error?.message ?? '');
+  } catch {
+    msg = body;
+  }
+  if (code === 190 || status === 401) {
+    return 'WhatsApp : jeton invalide ou expiré (code 190). Générez-en un nouveau sur Meta et mettez à jour WHATSAPP_TOKEN dans Render.';
+  }
+  if (code === 131030) {
+    return 'WhatsApp : destinataire non autorisé (code 131030). Ajoutez ce numéro dans la liste « Destinataire » de la page Meta.';
+  }
+  if (code === 100) {
+    return 'WhatsApp : numéro introuvable ou jeton sans permission (code 100). Vérifiez WHATSAPP_PHONE_NUMBER_ID et l\'application du jeton.';
+  }
+  if (code === 132000 || code === 132001) {
+    return `WhatsApp : modèle de message invalide (code ${code}). Vérifiez WHATSAPP_TEMPLATE et sa langue.`;
+  }
+  return `WhatsApp ${status}${code ? ` (code ${code})` : ''} : ${msg.slice(0, 120)}`;
+}
+
 async function sendWhatsApp(to: string, p: Payload) {
   // WhatsApp impose un template approuvé pour écrire en premier : hello_world pour les tests.
   const template: Record<string, unknown> = {
@@ -134,11 +167,11 @@ async function sendWhatsApp(to: string, p: Payload) {
   const version = env('WHATSAPP_API_VERSION') || 'v23.0';
   const res = await fetch(`https://graph.facebook.com/${version}/${env('WHATSAPP_PHONE_NUMBER_ID')}/messages`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${env('WHATSAPP_TOKEN')}`, 'content-type': 'application/json' },
+    headers: { Authorization: `Bearer ${whatsappToken()}`, 'content-type': 'application/json' },
     body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'template', template }),
     signal: AbortSignal.timeout(10_000),
   });
-  if (!res.ok) throw new Error(`WhatsApp ${res.status}: ${(await res.text()).slice(0, 150)}`);
+  if (!res.ok) throw new Error(explainWhatsAppError(res.status, await res.text()));
 }
 
 /** Message de test envoyé depuis la page Configuration (bouton « Envoyer un message de test »). */
