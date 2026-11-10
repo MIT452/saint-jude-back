@@ -45,7 +45,7 @@ const CORS_ORIGINS = CORS_ORIGIN.split(',').map((origin) => origin.trim()).filte
    MIDDLEWARES
 ========================= */
 
-app.set('trust proxy', true);
+app.set('trust proxy', 1);
 
 app.use(
   cors({
