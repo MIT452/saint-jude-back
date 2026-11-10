@@ -87,7 +87,7 @@ const isStrongPassword = (p: string) =>
 const WINDOW_MS = 15 * 60 * 1000;
 const MAX_FAILURES_PER_EMAIL = 5;
 const MAX_FAILURES_PER_IP = 20;
-// Connexion : clé = IP + e-mail, pour qu'un attaquant ne puisse pas bloquer le compte d'un autre utilisateur depuis sa propre IP
+// Connexion : clé = IP + identifiant, pour qu'un attaquant ne puisse pas bloquer le compte d'un autre utilisateur depuis sa propre IP
 const MAX_LOGIN_FAILURES_PER_PAIR = 5;
 const MAX_LOGIN_FAILURES_PER_IP = 30;
 // Compteurs en mémoire : remis à zéro au redémarrage de Render (suffisant pour une seule instance)
@@ -117,13 +117,23 @@ const registerFailure = (key: string) => {
 const isBlocked = (email: string, ip: string) =>
   failureCount(`email:${email}`) >= MAX_FAILURES_PER_EMAIL || failureCount(`ip:${ip}`) >= MAX_FAILURES_PER_IP;
 
-const isLoginBlocked = (email: string, ip: string) =>
-  failureCount(`login:${ip}:${email}`) >= MAX_LOGIN_FAILURES_PER_PAIR || failureCount(`loginip:${ip}`) >= MAX_LOGIN_FAILURES_PER_IP;
-
-const registerLoginFailure = (email: string, ip: string) => {
-  registerFailure(`login:${ip}:${email}`);
+const registerLoginFailure = (id: string, ip: string) => {
+  registerFailure(`login:${ip}:${id}`);
   registerFailure(`loginip:${ip}`);
 };
+
+// Secondes à attendre avant que ce compteur se débloque (0 = pas bloqué)
+const retryAfterSeconds = (key: string, max: number) => {
+  const entry = failures.get(key);
+  if (!entry || entry.resetAt <= Date.now() || entry.count < max) return 0;
+  return Math.ceil((entry.resetAt - Date.now()) / 1000);
+};
+
+const loginRetryAfter = (id: string, ip: string) =>
+  Math.max(
+    retryAfterSeconds(`login:${ip}:${id}`, MAX_LOGIN_FAILURES_PER_PAIR),
+    retryAfterSeconds(`loginip:${ip}`, MAX_LOGIN_FAILURES_PER_IP),
+  );
 
 /**
  * Le navigateur ne décide jamais seul de son rôle :
@@ -255,9 +265,16 @@ router.post("/login", async (request, response) => {
   }
 
   const ip = request.ip ?? "unknown";
-  // Après 5 échecs (même IP + même e-mail) ou 30 échecs (même IP) en 15 min : pause
-  if (isLoginBlocked(email, ip)) {
-    response.status(429).json({ error: "Trop de tentatives. Réessayez dans quelques minutes." });
+  // Clé de limitation : un même numéro écrit de plusieurs façons (034 12 345 67, 0341234567...) compte pour un seul compte
+  const loginKey = email.includes("@") ? email : (toIntlPhone(email) ?? email);
+
+  // Après 5 échecs (même IP + même identifiant) ou 30 échecs (même IP) en 15 min : pause
+  const retryAfter = loginRetryAfter(loginKey, ip);
+  if (retryAfter > 0) {
+    response.set("Retry-After", String(retryAfter));
+    response.status(429).json({
+      error: `Trop de tentatives. Réessayez dans ${Math.ceil(retryAfter / 60)} minute(s).`,
+    });
     return;
   }
 
@@ -274,7 +291,7 @@ router.post("/login", async (request, response) => {
       : { rows: [] as UserRow[] };
     const user = rows[0];
     if (!user || !(await verifyPassword(password, user.password))) {
-      registerLoginFailure(email, ip);
+      registerLoginFailure(loginKey, ip);
       await auditSafe({
         action: "LOGIN_FAILED",
         resource: "auth",
@@ -287,8 +304,8 @@ router.post("/login", async (request, response) => {
       return;
     }
 
-    // Connexion réussie : on remet à zéro le compteur de cette IP + e-mail
-    failures.delete(`login:${ip}:${email}`);
+    // Connexion réussie : on remet à zéro le compteur de cette IP + identifiant
+    failures.delete(`login:${ip}:${loginKey}`);
 
     if (!user.password.startsWith("scrypt$")) {
       await pool.query('UPDATE "user" SET password = $1 WHERE id = $2', [await hashPassword(password), user.id]);
