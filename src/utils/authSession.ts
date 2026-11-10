@@ -116,7 +116,12 @@ const readSessionCookie = (cookieHeader = "") => {
   const value = cookieHeader.split(";").map((cookie) => cookie.trim())
     .find((cookie) => cookie.startsWith(`${COOKIE_NAME}=`))
     ?.slice(COOKIE_NAME.length + 1);
-  return value ? decodeURIComponent(value) : "";
+  if (!value) return "";
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return ""; // cookie mal formé : session absente (401), pas une erreur serveur
+  }
 };
 
 const cookieOptions = () => ({
