@@ -6,6 +6,7 @@ import { auditSafe } from "../audit/auditService.js";
 import { roleKey } from "../utils/accessPolicy.js";
 import { assertAuthSecret, clearSessionCookie, normalizePermissions, requireAuth, setSessionCookie } from "../utils/authSession.js";
 import { hashPassword, verifyPassword } from "../utils/password.js";
+import { normalizePhone } from "../services/notifications.js";
 
 interface UserRow {
   id: string;
@@ -23,6 +24,18 @@ const safeUser = ({ password: _password, ...user }: UserRow) => ({
   permissions: normalizePermissions(user.permissions),
 });
 const router = Router();
+
+// 261341234567 -> ["261341234567", "0341234567"] : formes possibles d'un même numéro dans la base
+const phoneVariants = (intl: string) => [intl, `0${intl.slice(3)}`];
+
+// Numéro malgache valide en format international : 261 + 9 chiffres (ex. 261341234567)
+const toIntlPhone = (raw: unknown): string | null => {
+  const n = normalizePhone(raw);
+  return n && /^261\d{9}$/.test(n) ? n : null;
+};
+
+// Même numéro déjà utilisé par un autre compte ? (comparaison sur les chiffres seulement)
+const SQL_TEL_MATCH = `regexp_replace(COALESCE(tel, ''), '\\D', '', 'g') = ANY($1::text[])`;
 
 export function normalizeRegistrationInput(body: unknown) {
   const input = body && typeof body === "object" ? body as Record<string, unknown> : {};
@@ -149,6 +162,12 @@ router.post("/register", async (request, response) => {
     response.status(400).json({ error: "Nom, prénom, email valide et mot de passe de 8 à 128 caractères requis." });
     return;
   }
+  // Le téléphone sert à envoyer les confirmations WhatsApp : il est obligatoire
+  const telIntl = toIntlPhone(tel);
+  if (!telIntl) {
+    response.status(400).json({ error: "Numéro de téléphone valide requis (ex. 034 12 345 67)." });
+    return;
+  }
   if (!isStrongPassword(password)) {
     response.status(400).json({
       error: "Le mot de passe doit contenir une majuscule, une minuscule, un chiffre et un caractère spécial.",
@@ -186,12 +205,17 @@ router.post("/register", async (request, response) => {
 
   try {
     assertAuthSecret();
+    const dupTel = await pool.query(`SELECT 1 FROM "user" WHERE ${SQL_TEL_MATCH} LIMIT 1`, [phoneVariants(telIntl)]);
+    if (dupTel.rows.length > 0) {
+      response.status(409).json({ error: "Ce numéro de téléphone est déjà utilisé." });
+      return;
+    }
     const passwordHash = await hashPassword(password);
     const { rows } = await pool.query<UserRow>(
       `INSERT INTO "user" (id, name, "lastName", password, email, tel, role, permissions)
        VALUES ($1, $2, $3, $4, $5, $6, $7, '[]'::jsonb)
        RETURNING id, name, "lastName", email, tel, role, permissions, password`,
-      [uuid(), name, lastName, passwordHash, email, tel || null, resolved.role],
+      [uuid(), name, lastName, passwordHash, email, telIntl, resolved.role],
     );
 
     const user = rows[0];
@@ -219,10 +243,14 @@ router.post("/register", async (request, response) => {
 });
 
 router.post("/login", async (request, response) => {
-  const email = typeof request.body?.email === "string" ? request.body.email.trim().toLowerCase() : "";
+  // Identifiant : e-mail OU numéro de téléphone (champ « email », « identifier » ou « login »)
+  const rawId = [request.body?.email, request.body?.identifier, request.body?.login].find(
+    (v) => typeof v === "string" && v.trim(),
+  ) as string | undefined;
+  const email = (rawId ?? "").trim().toLowerCase();
   const password = typeof request.body?.password === "string" ? request.body.password : "";
   if (!email || !password) {
-    response.status(400).json({ error: "Email et mot de passe requis." });
+    response.status(400).json({ error: "E-mail ou téléphone et mot de passe requis." });
     return;
   }
 
@@ -235,10 +263,15 @@ router.post("/login", async (request, response) => {
 
   try {
     assertAuthSecret();
-    const { rows } = await pool.query<UserRow>(
-      'SELECT id, name, "lastName", email, tel, role, permissions, password FROM "user" WHERE LOWER(email) = $1 LIMIT 1',
-      [email],
-    );
+    const byEmail = email.includes("@");
+    const phone = byEmail ? null : toIntlPhone(email);
+    const { rows } = byEmail || phone
+      ? await pool.query<UserRow>(
+          `SELECT id, name, "lastName", email, tel, role, permissions, password FROM "user"
+           WHERE ${byEmail ? "LOWER(email) = $1" : SQL_TEL_MATCH} LIMIT 1`,
+          [byEmail ? email : phoneVariants(phone as string)],
+        )
+      : { rows: [] as UserRow[] };
     const user = rows[0];
     if (!user || !(await verifyPassword(password, user.password))) {
       registerLoginFailure(email, ip);
@@ -250,7 +283,7 @@ router.post("/login", async (request, response) => {
         result: "FAILURE",
         details: { email },
       });
-      response.status(401).json({ error: "Email ou mot de passe incorrect." });
+      response.status(401).json({ error: "Identifiant ou mot de passe incorrect." });
       return;
     }
 
@@ -308,6 +341,39 @@ router.post("/change-password", requireAuth, async (request, response) => {
   } catch (error) {
     console.error("Erreur lors du changement de mot de passe", error);
     response.status(500).json({ error: "Impossible de modifier le mot de passe." });
+  }
+});
+
+// Le client ajoute ou corrige son téléphone (anciens comptes sans numéro)
+router.put("/me/contact", requireAuth, async (request, response) => {
+  const telIntl = toIntlPhone(request.body?.tel ?? request.body?.phone);
+  if (!telIntl) {
+    response.status(400).json({ error: "Numéro de téléphone valide requis (ex. 034 12 345 67)." });
+    return;
+  }
+  const user = response.locals.sessionUser as Pick<UserRow, "id">;
+  try {
+    const dup = await pool.query(
+      `SELECT 1 FROM "user" WHERE ${SQL_TEL_MATCH} AND id <> $2 LIMIT 1`,
+      [phoneVariants(telIntl), user.id],
+    );
+    if (dup.rows.length > 0) {
+      response.status(409).json({ error: "Ce numéro de téléphone est déjà utilisé." });
+      return;
+    }
+    await pool.query('UPDATE "user" SET tel = $1 WHERE id = $2', [telIntl, user.id]);
+    await auditSafe({
+      action: "UPDATE",
+      resource: "user",
+      resourceId: user.id,
+      userId: user.id,
+      ip: request.ip,
+      details: { event: "update-contact" },
+    });
+    response.json({ tel: telIntl });
+  } catch (error) {
+    console.error("Erreur lors de la mise à jour du téléphone", error);
+    response.status(500).json({ error: "Impossible de modifier le téléphone." });
   }
 });
 
