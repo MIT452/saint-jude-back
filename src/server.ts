@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import morgan from 'morgan';
 import 'dotenv/config';
 import { createServer } from 'http';
@@ -45,7 +46,13 @@ const CORS_ORIGINS = CORS_ORIGIN.split(',').map((origin) => origin.trim()).filte
    MIDDLEWARES
 ========================= */
 
-app.set('trust proxy', 1);
+// Render place un seul proxy devant l'application : on ne fait confiance qu'à ce saut.
+// « true » laisserait un client choisir son IP via X-Forwarded-For et contourner la limite de connexions.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 1));
+
+// En-têtes de sécurité (nosniff, anti-framing, HSTS, pas de fuite du Referer, etc.)
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.disable('x-powered-by');
 
 app.use(
   cors({
@@ -56,7 +63,12 @@ app.use(
   })
 );
 
-app.use(express.json({ limit: '15mb' }));
+// Corps JSON : 1 Mo par défaut ; 15 Mo seulement pour l'assistant IA (voix, pièces jointes)
+app.use('/api/ai', express.json({ limit: '15mb' }));
+app.use('/api/ai-advanced', express.json({ limit: '15mb' }));
+app.use('/api/ai-capabilities', express.json({ limit: '15mb' }));
+app.use('/api/reservations/ai', express.json({ limit: '15mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 app.use(traceRequest);
 
