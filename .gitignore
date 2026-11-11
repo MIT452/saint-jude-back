@@ -10,3 +10,6 @@ ml-service/.venv/
 # Python cache
 __pycache__/
 *.pyc
+*.bak
+patch-ai.mjs
+resultat.txt
