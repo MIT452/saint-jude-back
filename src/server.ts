@@ -31,6 +31,7 @@ import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
 import { access } from './utils/accessPolicy.js'; // AJOUT DROITS
 import accessRouter from './routes/access.js'; // AJOUT DROITS : /api/access/me
 import boatsAvailableRouter from './routes/boatsAvailable.js'; // AJOUT BATEAUX LECTURE SEULE
+import { whatsappWebhookRouter, saveRawBody, internalChatOnly } from './routes/whatsappWebhook.js'; // AJOUT WHATSAPP 1/4
 
 const app = express();
 
@@ -62,6 +63,10 @@ app.use(
     credentials: true,
   })
 );
+
+// Webhook WhatsApp : le corps brut est conservé pour vérifier la signature de Meta.
+// Doit rester AVANT express.json() global.
+app.use('/webhooks/whatsapp', express.json({ limit: '1mb', verify: saveRawBody })); // AJOUT WHATSAPP 2/4
 
 // Corps JSON : 1 Mo par défaut ; 15 Mo seulement pour l'assistant IA (voix, pièces jointes)
 app.use('/api/ai', express.json({ limit: '15mb' }));
@@ -105,6 +110,16 @@ app.get('/api/health/database', async (_req, res) => {
 ========================= */
 
 app.get('/metrics', metricsHandler); // AJOUT AIOPS 3/3
+
+/* =========================
+   WHATSAPP (webhook Meta)
+   Hors /api : pas soumis à requireTrustedOrigin (Meta n'envoie pas d'Origin).
+   Sécurisé par WHATSAPP_VERIFY_TOKEN (GET) et la signature META_APP_SECRET (POST).
+   /internal/whatsapp-ai : appel interne du webhook vers /chat (boucle locale + secret).
+========================= */
+
+app.use('/webhooks/whatsapp', whatsappWebhookRouter); // AJOUT WHATSAPP 3/4
+app.use('/internal/whatsapp-ai', internalChatOnly, aiRouter); // AJOUT WHATSAPP 4/4
 
 app.use('/api/auth', authRouter);
 app.use('/api/notification-settings', requireAuth, notificationSettingsRouter);
