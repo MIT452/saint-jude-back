@@ -9,6 +9,8 @@ const GRAPH_VERSION = 'v25.0';
 const CONTEXT_TTL_MS = 30 * 60_000;
 const SEEN_TTL_MS = 10 * 60_000;
 const RATE_LIMIT_PER_MIN = 12;
+const MAX_CHARS_PER_MESSAGE = 900; // au-delà, WhatsApp replie le message (« Read more »)
+const MAX_MESSAGES = 4;
 
 // Secret généré à chaque démarrage : sert uniquement à l'appel interne vers /chat
 const INTERNAL_SECRET = crypto.randomBytes(24).toString('hex');
@@ -109,8 +111,46 @@ async function findAdminByPhone(from: string): Promise<{ name: string } | null> 
   return { name: `${rows[0].name ?? ''} ${rows[0].lastName ?? ''}`.trim() };
 }
 
+/* =========================================================
+   Mise en forme WhatsApp : *gras*, listes, emojis, messages courts
+========================================================= */
+
+/** Retire les caractères qui casseraient la mise en forme WhatsApp (* _ ~ `). */
+const clean = (s: unknown) => String(s ?? '').replace(/[*_~`]/g, '').trim();
+
+/** Montant avec espace insécable avant « Ar » : il ne se coupe plus en fin de ligne. */
+const ar = (n: number) => `${n.toLocaleString('fr-FR')}\u00A0Ar`;
+
+const frDate = (iso: string) => iso.split('-').reverse().join('/');
+
+/** Découpe en plusieurs messages d'au plus `max` caractères, en répétant le titre du groupe si besoin. */
+function packMessages(
+  header: string,
+  groups: Array<{ title: string; lines: string[] }>,
+  max = MAX_CHARS_PER_MESSAGE,
+): string[] {
+  const messages: string[] = [];
+  let current = header;
+
+  for (const g of groups) {
+    let titleShown = false;
+    for (const line of g.lines) {
+      let piece = titleShown ? `\n${line}` : `\n\n${g.title}\n${line}`;
+      if (current.length + piece.length > max) {
+        messages.push(current);
+        current = titleShown ? `${g.title} (suite)` : g.title;
+        piece = `\n${line}`;
+      }
+      current += piece;
+      titleShown = true;
+    }
+  }
+  messages.push(current);
+  return messages;
+}
+
 /** Réservations en attente, lues dans la base (lecture seule, sans téléphone ni e-mail). */
-async function answerPendingReservations(): Promise<string> {
+async function answerPendingReservations(): Promise<string[]> {
   const { rows } = await pool.query(
     `SELECT r.id, r."clientName", r.quantity, r.weight, r."totalPrice",
             t."from" AS dep, t."to" AS dest,
@@ -120,27 +160,58 @@ async function answerPendingReservations(): Promise<string> {
      LEFT JOIN trips t ON r."tripId" = t.id
      WHERE UPPER(REPLACE(COALESCE(r.status, ''), ' ', '_')) IN ('EN_ATTENTE', 'PENDING')
      ORDER BY t.depart ASC NULLS LAST
-     LIMIT 10`,
+     LIMIT 40`,
   );
 
-  if (rows.length === 0) return 'Aucune réservation en attente pour le moment.';
+  if (rows.length === 0) return ['Aucune réservation en attente pour le moment.'];
 
   const total = Number(rows[0].total);
-  const lines = rows.map((r: any) => {
-    const ref = String(r.id).slice(0, 8);
-    const client = r.clientName ? String(r.clientName) : 'Client';
-    const route = r.dep && r.dest ? `${r.dep} → ${r.dest}` : 'trajet inconnu';
-    const day = r.day ? ` le ${String(r.day).split('-').reverse().join('/')}` : '';
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Indian/Antananarivo' }).format(new Date());
+
+  const groups = new Map<string, { title: string; lines: string[] }>();
+  let sum = 0;
+  let hasPast = false;
+
+  for (const r of rows) {
+    const price = Number(r.totalPrice);
+    if (Number.isFinite(price)) sum += price;
+
+    const past = r.day ? String(r.day) < today : false;
+    if (past) hasPast = true;
+
+    const route = r.dep && r.dest ? `${clean(r.dep)} → ${clean(r.dest)}` : 'Trajet inconnu';
+    const key = `${route}|${r.day ?? ''}`;
+
+    let g = groups.get(key);
+    if (!g) {
+      g = {
+        title: `🚢 *${route}*${r.day ? ` · ${frDate(String(r.day))}` : ''}${past ? ' ⚠️' : ''}`,
+        lines: [],
+      };
+      groups.set(key, g);
+    }
+
     const qty = Number(r.quantity) > 0 ? ` · qté ${Number(r.quantity)}` : '';
     const kg = Number(r.weight) > 0 ? ` · ${Number(r.weight).toLocaleString('fr-FR')} kg` : '';
-    const price = Number.isFinite(Number(r.totalPrice))
-      ? ` · ${Number(r.totalPrice).toLocaleString('fr-FR')} Ar`
-      : '';
-    return `- #${ref} · ${client} · ${route}${day}${qty}${kg}${price}`;
-  });
+    const amount = Number.isFinite(price) ? ` · *${ar(price)}*` : '';
+    g.lines.push(`• #${String(r.id).slice(0, 8)} · ${clean(r.clientName) || 'Client'}${qty}${kg}${amount}`);
+  }
 
-  const more = total > rows.length ? `\n… et ${total - rows.length} autre(s). Ouvrez l’application pour la liste complète.` : '';
-  return `Réservations en attente : ${total}\n${lines.join('\n')}${more}`;
+  // Le montant total n'est donné que si toutes les réservations ont été lues
+  let header = `📋 *Réservations en attente : ${total}*`;
+  if (total === rows.length) header += `\n💰 Montant total : *${ar(sum)}*`;
+  if (hasPast) header += `\n⚠️ = voyage déjà passé`;
+
+  let messages = packMessages(header, [...groups.values()]);
+  const hidden = total - rows.length;
+
+  if (messages.length > MAX_MESSAGES) {
+    messages = messages.slice(0, MAX_MESSAGES);
+    messages[MAX_MESSAGES - 1] += '\n\n… La suite est dans l’application Saint-Jude.';
+  } else if (hidden > 0) {
+    messages[messages.length - 1] += `\n\n… et ${hidden} autre(s) dans l’application Saint-Jude.`;
+  }
+  return messages;
 }
 
 /* =========================================================
@@ -195,15 +266,16 @@ async function processMessage(from: string, id: string, text: string): Promise<v
   // « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
   const n = normalize(text);
   if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
-    let answer = 'Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.';
+    let answers: string[] = ['Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.'];
     try {
       const admin = await findAdminByPhone(from);
       console.info(`[WhatsApp] réservations en attente demandées par ***${from.slice(-3)} : admin=${admin ? 'oui' : 'non'}`);
-      answer = admin ? await answerPendingReservations() : ADMIN_ONLY_MESSAGE;
+      answers = admin ? await answerPendingReservations() : [ADMIN_ONLY_MESSAGE];
     } catch (err) {
       console.warn(`[WhatsApp] consultation des réservations impossible : ${(err as Error).message}`);
     }
-    await sendText(from, answer);
+    // Envoi dans l'ordre : chaque message attend la fin du précédent
+    for (const part of answers) await sendText(from, part);
     return;
   }
 
