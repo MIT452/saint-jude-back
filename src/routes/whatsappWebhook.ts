@@ -171,27 +171,18 @@ whatsappWebhookRouter.post('/', (req: Request, res: Response) => {
   const raw = (req as any).rawBody as Buffer | undefined;
   const signature = String(req.get('x-hub-signature-256') ?? '');
   const expected = `sha256=${crypto.createHmac('sha256', secret).update(raw ?? Buffer.alloc(0)).digest('hex')}`;
-  if (!raw || !safeEqual(signature, expected)) {
-    // Diagnostic sans secret : longueurs uniquement (une clé Meta fait 32 caractères)
-    console.warn(
-      `[WhatsApp] signature refusée : longueurClé=${secret.length} corpsBrut=${raw ? raw.length : 'absent'} ` +
-        `entêteSignature=${signature ? signature.length : 'absent'} (attendu 71)`,
-    );
-    return res.sendStatus(401);
-  }
+  if (!raw || !safeEqual(signature, expected)) return res.sendStatus(401);
 
   // Répondre tout de suite : Meta réessaie si la réponse tarde
   res.sendStatus(200);
 
   const entries: any[] = Array.isArray(req.body?.entry) ? req.body.entry : [];
-  let count = 0;
   for (const entry of entries) {
     for (const change of entry?.changes ?? []) {
       for (const msg of change?.value?.messages ?? []) {
         const from = String(msg?.from ?? '');
         const id = String(msg?.id ?? '');
         if (!from || !id) continue;
-        count += 1;
 
         if (msg.type === 'text' && typeof msg.text?.body === 'string') {
           const text = msg.text.body.trim().slice(0, 1000);
@@ -203,5 +194,4 @@ whatsappWebhookRouter.post('/', (req: Request, res: Response) => {
       }
     }
   }
-  console.info(`[WhatsApp] webhook accepté : ${count} message(s)`);
 });
