@@ -32,6 +32,7 @@ import { access } from './utils/accessPolicy.js'; // AJOUT DROITS
 import accessRouter from './routes/access.js'; // AJOUT DROITS : /api/access/me
 import boatsAvailableRouter from './routes/boatsAvailable.js'; // AJOUT BATEAUX LECTURE SEULE
 import { whatsappWebhookRouter, saveRawBody, internalChatOnly } from './routes/whatsappWebhook.js'; // AJOUT WHATSAPP 1/4
+import { legalRouter } from './routes/legal.js'; // AJOUT LEGAL 1/2
 
 const app = express();
 
@@ -110,6 +111,14 @@ app.get('/api/health/database', async (_req, res) => {
 ========================= */
 
 app.get('/metrics', metricsHandler); // AJOUT AIOPS 3/3
+
+/* =========================
+   PAGES LÉGALES (publiques, exigées par Meta)
+   /confidentialite et /suppression-donnees
+   Hors /api : aucune authentification requise.
+========================= */
+
+app.use(legalRouter); // AJOUT LEGAL 2/2
 
 /* =========================
    WHATSAPP (webhook Meta)
