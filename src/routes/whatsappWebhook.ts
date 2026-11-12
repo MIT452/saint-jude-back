@@ -2,6 +2,7 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import crypto from 'node:crypto';
 import { pool } from '../db.js';
+import { formatReservationList } from '../utils/whatsappFormat.js';
 
 export const whatsappWebhookRouter = Router();
 
@@ -9,7 +10,6 @@ const GRAPH_VERSION = 'v25.0';
 const CONTEXT_TTL_MS = 30 * 60_000;
 const SEEN_TTL_MS = 10 * 60_000;
 const RATE_LIMIT_PER_MIN = 12;
-const MAX_CHARS_PER_MESSAGE = 900; // au-delà, WhatsApp replie le message (« Read more »)
 const MAX_MESSAGES = 4;
 
 // Secret généré à chaque démarrage : sert uniquement à l'appel interne vers /chat
@@ -20,7 +20,8 @@ const APP_CONFIRM_MESSAGE =
   'Ici, je peux vérifier les voyages, les tarifs et préparer votre demande.';
 
 const ADMIN_ONLY_MESSAGE =
-  'Cette information est réservée aux administrateurs. Votre numéro doit être enregistré dans votre profil Saint-Jude (champ téléphone) avec un rôle administrateur.';
+  '🔒 Cette information est réservée aux administrateurs. ' +
+  'Votre numéro doit être enregistré dans votre profil Saint-Jude (champ téléphone) avec un rôle administrateur.';
 
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -112,49 +113,17 @@ async function findAdminByPhone(from: string): Promise<{ name: string } | null> 
 }
 
 /* =========================================================
-   Mise en forme WhatsApp : *gras*, listes, emojis, messages courts
+   Réservations en attente : cartes stylisées avec icônes
+   (lecture seule, sans téléphone ni e-mail)
 ========================================================= */
+const nbr = (n: number) => n.toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ');
 
-/** Retire les caractères qui casseraient la mise en forme WhatsApp (* _ ~ `). */
-const clean = (s: unknown) => String(s ?? '').replace(/[*_~`]/g, '').trim();
-
-/** Montant avec espace insécable avant « Ar » : il ne se coupe plus en fin de ligne. */
-const ar = (n: number) => `${n.toLocaleString('fr-FR')}\u00A0Ar`;
-
-const frDate = (iso: string) => iso.split('-').reverse().join('/');
-
-/** Découpe en plusieurs messages d'au plus `max` caractères, en répétant le titre du groupe si besoin. */
-function packMessages(
-  header: string,
-  groups: Array<{ title: string; lines: string[] }>,
-  max = MAX_CHARS_PER_MESSAGE,
-): string[] {
-  const messages: string[] = [];
-  let current = header;
-
-  for (const g of groups) {
-    let titleShown = false;
-    for (const line of g.lines) {
-      let piece = titleShown ? `\n${line}` : `\n\n${g.title}\n${line}`;
-      if (current.length + piece.length > max) {
-        messages.push(current);
-        current = titleShown ? `${g.title} (suite)` : g.title;
-        piece = `\n${line}`;
-      }
-      current += piece;
-      titleShown = true;
-    }
-  }
-  messages.push(current);
-  return messages;
-}
-
-/** Réservations en attente, lues dans la base (lecture seule, sans téléphone ni e-mail). */
 async function answerPendingReservations(): Promise<string[]> {
   const { rows } = await pool.query(
     `SELECT r.id, r."clientName", r.quantity, r.weight, r."totalPrice",
-            t."from" AS dep, t."to" AS dest,
-            to_char(t.depart::date, 'YYYY-MM-DD') AS day,
+            r.status, r."paymentStatus",
+            t."from" AS departure, t."to" AS destination,
+            to_char(t.depart::date, 'YYYY-MM-DD') AS date,
             COUNT(*) OVER () AS total
      FROM reservations r
      LEFT JOIN trips t ON r."tripId" = t.id
@@ -163,47 +132,32 @@ async function answerPendingReservations(): Promise<string[]> {
      LIMIT 40`,
   );
 
-  if (rows.length === 0) return ['Aucune réservation en attente pour le moment.'];
+  if (rows.length === 0) return ['😌 *Réservations en attente*\nAucune réservation en attente pour le moment.'];
 
   const total = Number(rows[0].total);
-  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Indian/Antananarivo' }).format(new Date());
-
-  const groups = new Map<string, { title: string; lines: string[] }>();
-  let sum = 0;
-  let hasPast = false;
-
-  for (const r of rows) {
-    const price = Number(r.totalPrice);
-    if (Number.isFinite(price)) sum += price;
-
-    const past = r.day ? String(r.day) < today : false;
-    if (past) hasPast = true;
-
-    const route = r.dep && r.dest ? `${clean(r.dep)} → ${clean(r.dest)}` : 'Trajet inconnu';
-    const key = `${route}|${r.day ?? ''}`;
-
-    let g = groups.get(key);
-    if (!g) {
-      g = {
-        title: `🚢 *${route}*${r.day ? ` · ${frDate(String(r.day))}` : ''}${past ? ' ⚠️' : ''}`,
-        lines: [],
-      };
-      groups.set(key, g);
-    }
-
-    const qty = Number(r.quantity) > 0 ? ` · qté ${Number(r.quantity)}` : '';
-    const kg = Number(r.weight) > 0 ? ` · ${Number(r.weight).toLocaleString('fr-FR')} kg` : '';
-    const amount = Number.isFinite(price) ? ` · *${ar(price)}*` : '';
-    g.lines.push(`• #${String(r.id).slice(0, 8)} · ${clean(r.clientName) || 'Client'}${qty}${kg}${amount}`);
-  }
-
-  // Le montant total n'est donné que si toutes les réservations ont été lues
-  let header = `📋 *Réservations en attente : ${total}*`;
-  if (total === rows.length) header += `\n💰 Montant total : *${ar(sum)}*`;
-  if (hasPast) header += `\n⚠️ = voyage déjà passé`;
-
-  let messages = packMessages(header, [...groups.values()]);
   const hidden = total - rows.length;
+  const sum = rows.reduce((acc, r) => acc + (Number.isFinite(Number(r.totalPrice)) ? Number(r.totalPrice) : 0), 0);
+
+  const footer =
+    total === rows.length
+      ? `💰 Montant total : *${nbr(sum)} Ar*`
+      : `📊 ${rows.length} sur ${total} affichées`;
+
+  let messages = formatReservationList(
+    rows.map((r) => ({
+      id: String(r.id),
+      clientName: r.clientName,
+      departure: r.departure,
+      destination: r.destination,
+      date: r.date,
+      quantity: r.quantity,
+      weightKg: r.weight,
+      totalPrice: r.totalPrice,
+      status: r.status,
+      paymentStatus: r.paymentStatus,
+    })),
+    { title: 'Réservations en attente', defaultStatus: 'En attente', footer },
+  );
 
   if (messages.length > MAX_MESSAGES) {
     messages = messages.slice(0, MAX_MESSAGES);
@@ -266,7 +220,7 @@ async function processMessage(from: string, id: string, text: string): Promise<v
   // « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
   const n = normalize(text);
   if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
-    let answers: string[] = ['Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.'];
+    let answers: string[] = ['⚠️ Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.'];
     try {
       const admin = await findAdminByPhone(from);
       console.info(`[WhatsApp] réservations en attente demandées par ***${from.slice(-3)} : admin=${admin ? 'oui' : 'non'}`);
