@@ -1,12 +1,14 @@
 // src/routes/whatsappWebhook.ts
 import { Router, type NextFunction, type Request, type Response } from 'express';
 import crypto from 'node:crypto';
+import { pool } from '../db.js';
 
 export const whatsappWebhookRouter = Router();
 
 const GRAPH_VERSION = 'v25.0';
 const CONTEXT_TTL_MS = 30 * 60_000;
 const SEEN_TTL_MS = 10 * 60_000;
+const RATE_LIMIT_PER_MIN = 12;
 
 // Secret généré à chaque démarrage : sert uniquement à l'appel interne vers /chat
 const INTERNAL_SECRET = crypto.randomBytes(24).toString('hex');
@@ -14,6 +16,9 @@ const INTERNAL_SECRET = crypto.randomBytes(24).toString('hex');
 const APP_CONFIRM_MESSAGE =
   'Pour confirmer et enregistrer cette réservation, connectez-vous à l’application Saint-Jude. ' +
   'Ici, je peux vérifier les voyages, les tarifs et préparer votre demande.';
+
+const ADMIN_ONLY_MESSAGE =
+  'Cette information est réservée aux administrateurs. Votre numéro doit être enregistré dans votre profil Saint-Jude (champ téléphone) avec un rôle administrateur.';
 
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -47,17 +52,96 @@ interface ConversationState {
 }
 const conversations = new Map<string, ConversationState>();
 const seen = new Map<string, number>(); // ids de messages déjà traités (Meta peut renvoyer)
+const rate = new Map<string, number[]>(); // horodatages récents par numéro
 
 setInterval(() => {
   const now = Date.now();
   for (const [k, v] of conversations) if (now - v.at > CONTEXT_TTL_MS) conversations.delete(k);
   for (const [k, t] of seen) if (now - t > SEEN_TTL_MS) seen.delete(k);
+  for (const [k, v] of rate) if (!v.some((t) => now - t < 60_000)) rate.delete(k);
 }, 60_000).unref?.();
 
 const normalize = (s: string) =>
   s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/’/g, "'").toLowerCase().trim();
 
 const isYes = (s: string) => /^(oui|ok|d'accord|confirme|confirmer|valide|valider|eny)\b/.test(normalize(s));
+
+function allowByRate(from: string): boolean {
+  const now = Date.now();
+  const recent = (rate.get(from) ?? []).filter((t) => now - t < 60_000);
+  if (recent.length >= RATE_LIMIT_PER_MIN) {
+    rate.set(from, recent);
+    return false;
+  }
+  recent.push(now);
+  rate.set(from, recent);
+  return true;
+}
+
+/* =========================================================
+   Administrateurs : identifiés par leur numéro WhatsApp (signé par Meta)
+   Rôles acceptés : variable WHATSAPP_ADMIN_ROLES (séparés par des virgules),
+   sinon admin, administrateur, proprietaire, owner. Accents et majuscules ignorés.
+========================================================= */
+const ADMIN_ROLES = (process.env.WHATSAPP_ADMIN_ROLES ?? 'admin,administrateur,proprietaire,owner')
+  .split(',')
+  .map((r) => normalize(r))
+  .filter(Boolean);
+
+/** Retourne l'administrateur si le numéro correspond à UN SEUL compte, dont le rôle est admin. */
+async function findAdminByPhone(from: string): Promise<{ name: string } | null> {
+  const digits = from.replace(/\D/g, '');
+  if (digits.length < 9) return null;
+  const tail = digits.slice(-9);
+
+  const { rows } = await pool.query(
+    `SELECT name, "lastName", role FROM "user"
+     WHERE LENGTH(regexp_replace(COALESCE(tel, ''), '\\D', '', 'g')) >= 9
+       AND RIGHT(regexp_replace(COALESCE(tel, ''), '\\D', '', 'g'), 9) = $1
+     LIMIT 3`,
+    [tail],
+  );
+  // Deux comptes avec le même numéro : on refuse (aucune élévation de droits possible)
+  if (rows.length !== 1) return null;
+
+  const role = normalize(String(rows[0].role ?? ''));
+  if (!ADMIN_ROLES.includes(role)) return null;
+  return { name: `${rows[0].name ?? ''} ${rows[0].lastName ?? ''}`.trim() };
+}
+
+/** Réservations en attente, lues dans la base (lecture seule, sans téléphone ni e-mail). */
+async function answerPendingReservations(): Promise<string> {
+  const { rows } = await pool.query(
+    `SELECT r.id, r."clientName", r.quantity, r.weight, r."totalPrice",
+            t."from" AS dep, t."to" AS dest,
+            to_char(t.depart::date, 'YYYY-MM-DD') AS day,
+            COUNT(*) OVER () AS total
+     FROM reservations r
+     LEFT JOIN trips t ON r."tripId" = t.id
+     WHERE UPPER(REPLACE(COALESCE(r.status, ''), ' ', '_')) IN ('EN_ATTENTE', 'PENDING')
+     ORDER BY t.depart ASC NULLS LAST
+     LIMIT 10`,
+  );
+
+  if (rows.length === 0) return 'Aucune réservation en attente pour le moment.';
+
+  const total = Number(rows[0].total);
+  const lines = rows.map((r: any) => {
+    const ref = String(r.id).slice(0, 8);
+    const client = r.clientName ? String(r.clientName) : 'Client';
+    const route = r.dep && r.dest ? `${r.dep} → ${r.dest}` : 'trajet inconnu';
+    const day = r.day ? ` le ${String(r.day).split('-').reverse().join('/')}` : '';
+    const qty = Number(r.quantity) > 0 ? ` · qté ${Number(r.quantity)}` : '';
+    const kg = Number(r.weight) > 0 ? ` · ${Number(r.weight).toLocaleString('fr-FR')} kg` : '';
+    const price = Number.isFinite(Number(r.totalPrice))
+      ? ` · ${Number(r.totalPrice).toLocaleString('fr-FR')} Ar`
+      : '';
+    return `- #${ref} · ${client} · ${route}${day}${qty}${kg}${price}`;
+  });
+
+  const more = total > rows.length ? `\n… et ${total - rows.length} autre(s). Ouvrez l’application pour la liste complète.` : '';
+  return `Réservations en attente : ${total}\n${lines.join('\n')}${more}`;
+}
 
 /* =========================================================
    Envoi d'un message texte (réponse libre : possible 24 h après le message du client)
@@ -93,6 +177,11 @@ async function processMessage(from: string, id: string, text: string): Promise<v
   if (seen.has(id)) return;
   seen.set(id, Date.now());
 
+  if (!allowByRate(from)) {
+    console.warn(`[WhatsApp] trop de messages de ***${from.slice(-3)} : ignoré`);
+    return;
+  }
+
   const prev = conversations.get(from);
   const state: ConversationState =
     prev && Date.now() - prev.at < CONTEXT_TTL_MS ? prev : { draft: {}, quoted: false, at: Date.now() };
@@ -100,6 +189,21 @@ async function processMessage(from: string, id: string, text: string): Promise<v
   // Le client dit « oui » après le devis : la confirmation se fait dans l'application
   if (state.quoted && isYes(text)) {
     await sendText(from, APP_CONFIRM_MESSAGE);
+    return;
+  }
+
+  // « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
+  const n = normalize(text);
+  if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
+    let answer = 'Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.';
+    try {
+      const admin = await findAdminByPhone(from);
+      console.info(`[WhatsApp] réservations en attente demandées par ***${from.slice(-3)} : admin=${admin ? 'oui' : 'non'}`);
+      answer = admin ? await answerPendingReservations() : ADMIN_ONLY_MESSAGE;
+    } catch (err) {
+      console.warn(`[WhatsApp] consultation des réservations impossible : ${(err as Error).message}`);
+    }
+    await sendText(from, answer);
     return;
   }
 
