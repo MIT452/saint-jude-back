@@ -79,6 +79,72 @@ function polish(text: string): string {
 }
 
 /* =========================================================
+   Ancrage dans la base : tout fait cité doit venir de Neon (ou avoir été dit dans la conversation)
+========================================================= */
+const compact = (s: string) => norm(s).replace(/[^a-z0-9]/g, '');
+const MONTHS_NORM = ['janvier', 'fevrier', 'mars', 'avril', 'mai', 'juin', 'juillet', 'aout', 'septembre', 'octobre', 'novembre', 'decembre'];
+
+/** Clés « jour/mois » des dates écrites dans un texte (AAAA-MM-JJ, JJ/MM/AAAA, « 15 novembre »). */
+function dateKeys(text: string): Set<string> {
+  const keys = new Set<string>();
+  const t = norm(text);
+  for (const m of t.matchAll(/\b(\d{4})-(\d{2})-(\d{2})\b/g)) keys.add(`${Number(m[3])}/${Number(m[2])}`);
+  for (const m of t.matchAll(/\b(\d{1,2})\/(\d{1,2})(?:\/\d{2,4})?\b/g)) keys.add(`${Number(m[1])}/${Number(m[2])}`);
+  for (const m of t.matchAll(/\b(\d{1,2})(?:er)?\s+(janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre)\b/g)) {
+    keys.add(`${Number(m[1])}/${MONTHS_NORM.indexOf(m[2]) + 1}`);
+  }
+  return keys;
+}
+
+/** Heures écrites dans un texte (08:00, 08h, 8 h 30) sous la forme « h:m ». */
+function timeKeys(text: string): Set<string> {
+  const keys = new Set<string>();
+  for (const m of text.matchAll(/\b(\d{1,2})\s?(?:h|:)\s?(\d{2})?\b/gi)) {
+    keys.add(`${Number(m[1])}:${Number(m[2] ?? 0)}`);
+  }
+  return keys;
+}
+
+/** Nombres (chiffres seuls) présents dans un texte, avec ou sans espaces de milliers. */
+function numberSet(text: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of text.matchAll(/\d[\d   ]*\d|\d/g)) out.add(m[0].replace(/\D/g, ''));
+  for (const m of text.matchAll(/\d+/g)) out.add(m[0]);
+  return out;
+}
+
+/**
+ * Éléments d'une réponse qui ne figurent ni dans la base lue ni dans la conversation :
+ * dates, heures, montants / places / tonnes, nom de navire. Liste vide = réponse ancrée.
+ */
+function ungrounded(reply: string, evidence: string): string[] {
+  const allowed = `${evidence}\n${todayIso()}`;
+  const okDates = dateKeys(allowed);
+  const okTimes = timeKeys(allowed);
+  const okNums = numberSet(allowed);
+  const okText = compact(allowed);
+  const bad = new Set<string>();
+
+  for (const k of dateKeys(reply)) if (!okDates.has(k)) bad.add(`la date ${k}`);
+  for (const k of timeKeys(reply)) if (!okTimes.has(k)) bad.add(`l'heure ${k.replace(':', ' h ')}`);
+
+  const numAfter = /(\d[\d   ]*\d)\s?(Ar|places?|tonnes?)\b/gi;
+  const numBefore = /(?:restantes?|restent|reste|capacit[eé]|tarif|prix)\s*(?:de|:)?\s*(\d[\d   ]*\d)/gi;
+  for (const re of [numAfter, numBefore]) {
+    for (const m of reply.matchAll(re)) {
+      const digits = m[1].replace(/\D/g, '');
+      if (digits.length >= 2 && !okNums.has(digits)) bad.add(`le nombre ${m[1].trim()}`);
+    }
+  }
+
+  // Noms de navire écrits avec une majuscule (« navire Arcanum », « bateau Joy »)
+  for (const m of reply.matchAll(/\b(?:navire|bateau)\s+\*{0,2}([A-ZÀ-Ý][A-Za-zÀ-ÿ0-9-]+)/g)) {
+    if (!okText.includes(compact(m[1]))) bad.add(`le navire ${m[1]}`);
+  }
+  return [...bad];
+}
+
+/* =========================================================
    Compréhension du tour : le code aide le modèle à raisonner comme une personne
 ========================================================= */
 const REFUSAL_RE = /^(non|nan|non merci|pas du tout|pas maintenant|laisse tomber|no|nope|tsia|tsy mila)[\s.!]*$/;
@@ -161,6 +227,7 @@ function buildSystemPrompt(
   boatsData = '',
   firstName: string | null = null,
   hints = '',
+  tripsData = '',
 ): string {
   const p = ctx.conv.pending;
   const pendingText = p
@@ -173,6 +240,10 @@ function buildSystemPrompt(
 
   const clientText = firstName
     ? `\nLe client s'appelle ${firstName}. Utilise son prénom rarement : une fois à l'accueil, éventuellement au remerciement final, jamais dans deux réponses de suite.`
+    : '';
+
+  const tripsText = tripsData
+    ? `DONNÉES VOYAGES (lues dans la base Neon à l'instant, seule source de vérité) :\n${tripsData}\nPour toute question sur les voyages, départs, dates, tarifs ou places, réponds uniquement avec ces données (ou le résultat d'un outil). Ne cite jamais un voyage, une date, une heure, un tarif ou un nombre de places qui n'y figure pas. Si ces données ne contiennent rien sur la demande, dis-le simplement.\n\n`
     : '';
 
   const hintsText = hints ? `\n\nCONSIGNES POUR CE TOUR\n${hints}` : '';
@@ -220,7 +291,9 @@ PAIEMENT
 - Ne dis pas au client de cliquer sur « Confirmer » tant que le mode de paiement n'est pas choisi.
 
 RÈGLES STRICTES
-- Aucun prix, horaire, disponibilité, nombre de places ou nom de bateau sans avoir appelé l'outil correspondant (ou sans l'avoir lu dans les DONNÉES BATEAUX ci-dessous). N'invente jamais un chiffre.
+- Aucun prix, horaire, disponibilité, nombre de places ou nom de bateau sans avoir appelé l'outil correspondant (ou sans l'avoir lu dans les DONNÉES BATEAUX ou DONNÉES VOYAGES ci-dessous). N'invente jamais un chiffre.
+- Chaque date, heure, tarif, nombre de places ou nom de navire de ta réponse doit venir de la base (DONNÉES ou outil) ou avoir été dit par le client. Sinon, ne l'écris pas. N'écris jamais d'exemple fictif (« par exemple le 15 novembre »).
+- Tu ne connais que ce que la base contient. Si une information n'y est pas, dis simplement que tu ne la trouves pas, sans l'inventer.
 - Pour lister_bateaux, n'utilise PAS le paramètre etat : appelle l'outil sans argument, puis lis l'état de chaque bateau dans le résultat.
 - Avant de proposer une réservation, vérifie le trajet avec verifier_trajet ou preparer_reservation. Si le trajet n'existe pas à cette date, appelle prochains_voyages pour proposer de vrais départs.
 - Tu ne peux PAS enregistrer une réservation. preparer_reservation crée seulement un récapitulatif ; le client doit cliquer sur le bouton « Confirmer ». Ne dis JAMAIS qu'une réservation est enregistrée, et ne prétends jamais l'avoir annulée.
@@ -228,7 +301,7 @@ RÈGLES STRICTES
 - Si un outil renvoie une erreur ou aucun résultat, dis-le honnêtement et propose une alternative (autre date, autre trajet).
 - Si la question n'a aucun rapport avec le transport maritime, dis-le poliment et brièvement.${pendingText}${hintsText}
 
-${boatsText}Contexte documentaire (à utiliser seulement s'il est pertinent) :
+${boatsText}${tripsText}Contexte documentaire (à utiliser seulement s'il est pertinent) :
 ${documents || 'Aucun document pertinent.'}`;
 }
 
@@ -470,6 +543,41 @@ async function tripsWithContext(depart: string | undefined, arrivee: string | un
   return result;
 }
 
+/**
+ * Voyages lus dans Neon pour les ports cités récemment par le client.
+ * Injectés dans le prompt : le modèle répond avec des données réelles, pas de mémoire.
+ */
+async function tripsContext(userMessages: string[], places: string[]): Promise<string> {
+  const current = userMessages[userMessages.length - 1] ?? '';
+  const portsIn = (text: string) => {
+    const t = norm(text);
+    return places
+      .map((p) => ({ p, i: t.indexOf(norm(p)) }))
+      .filter((x) => x.i >= 0)
+      .sort((x, y) => x.i - y.i)
+      .map((x) => x.p);
+  };
+
+  // ports du message le plus récent qui en cite
+  let mentioned: string[] = [];
+  for (const m of [...userMessages].reverse()) {
+    mentioned = portsIn(m);
+    if (mentioned.length) break;
+  }
+
+  const asked =
+    mentioned.length > 0 || /(voyage|trajet|depart|prochain|date|prix|tarif|ligne|que peux|que faire|alors)/.test(norm(current));
+  if (!asked) return '';
+
+  try {
+    const data = await tripsWithContext(mentioned[0], mentioned[1], 5);
+    return JSON.stringify(data).slice(0, 3500);
+  } catch (e) {
+    console.error('[agent] lecture voyages :', safeError(e));
+    return '';
+  }
+}
+
 async function runReservationTool(name: string, a: Record<string, unknown>, ctx: Ctx): Promise<unknown> {
   if (name === 'convertir_date') {
     const r = ctx.deps.parseRelativeDate(String(a.texte ?? ''));
@@ -686,6 +794,18 @@ async function fallbackReply(
   return "Je n'arrive pas à traiter votre message à l'instant. Pouvez-vous réessayer dans un moment ? Aucune réservation n'a été créée.";
 }
 
+/** Réponse de repli quand le modèle cite un fait absent de la base : uniquement des données réelles. */
+async function groundedFallback(message: string, places: string[], boatRows: BoatRow[] | null): Promise<string> {
+  const text = await fallbackReply(message, places, false, boatRows);
+  if (/^Je n'arrive pas à (traiter|vous répondre à l'instant)/.test(text)) {
+    return "Je préfère ne pas vous donner une information que je ne trouve pas dans notre base. Pouvez-vous me préciser le trajet ou la date qui vous intéresse ?";
+  }
+  return text
+    .replace(/^Je n'arrive pas à vous répondre en détail à l'instant\.\s*/, '')
+    .replace(/\n\nRéessayez dans un instant pour préciser votre demande\.$/, '')
+    .trim();
+}
+
 /** Prénom du client connecté (pour une conversation plus naturelle). */
 async function getFirstName(userId: string | null): Promise<string | null> {
   if (!userId) return null;
@@ -772,6 +892,14 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
     return { conversationId: conv.id, reply: direct, pending: publicPending(conv.pending) };
   }
 
+  // Voyages lus directement dans Neon (ports cités récemment) : le modèle répond avec ces données, jamais de mémoire
+  const userTexts = conv.messages.filter((m) => m.role === 'user').slice(-4).map((m) => String(m.content ?? ''));
+  const tripsData = await tripsContext(userTexts, places);
+
+  // Preuves : tout ce que la réponse a le droit de citer (base lue, résultats d'outils, conversation)
+  const evidence: string[] = [places.join(' '), boatsData, tripsData, JSON.stringify(conv.pending ?? {})];
+  const evidenceText = () => `${evidence.join('\n')}\n${conv.messages.map((m) => String(m.content ?? '')).join('\n')}`;
+
   const availableTools = [...toolDefs.filter((d) => relevant.has(d.function.name)), ...reservationToolDefs];
 
   // Consignes de ce tour : que veut dire un « non » ou un « pourquoi » par rapport à ma dernière réponse
@@ -780,7 +908,7 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
 
   // Les échanges d'outils vivent seulement dans ce tour ; l'historique stocké reste du texte propre.
   const turn: Msg[] = [
-    { role: 'system', content: buildSystemPrompt(ctx, places, docText, boatsData, firstName, hints) },
+    { role: 'system', content: buildSystemPrompt(ctx, places, docText, boatsData, firstName, hints, tripsData) },
     ...trim(conv.messages, MAX_HISTORY),
   ];
 
@@ -821,6 +949,7 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
           console.error(`[agent] outil ${name} :`, safeError(e));
           result = { erreur: "Échec de l'outil" };
         }
+        evidence.push(JSON.stringify(result));
         turn.push({ role: 'tool', tool_name: name, content: JSON.stringify(result).slice(0, 4000) });
       }
     }
@@ -844,6 +973,31 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
       if (!again.tool_calls?.length && text) reply = text;
     } catch (e) {
       console.warn('[agent] anti-répétition ignorée :', safeError(e));
+    }
+  }
+
+  // Ancrage : toute date, heure, tarif, nombre de places ou navire doit venir de Neon (ou de la conversation)
+  if (!degraded && reply) {
+    let bad = ungrounded(reply, evidenceText());
+    if (bad.length) {
+      console.warn('[agent] réponse non ancrée dans la base :', bad.join(', '));
+      try {
+        turn.push({ role: 'assistant', content: reply });
+        turn.push({
+          role: 'user',
+          content: `[Consigne interne] Ces éléments de ta réponse ne viennent pas de la base de données : ${bad.join(', ')}. Réécris ta réponse sans eux : n'utilise que les DONNÉES VOYAGES, les DONNÉES BATEAUX ou ce que le client a dit. Si tu n'as pas l'information, dis simplement que tu ne la trouves pas dans la base. Réponds uniquement par le nouveau message pour le client.`,
+        });
+        const again = await chatWithRetry(turn, undefined, { ...CHAT_OPTS, temperature: 0.3 });
+        const text = (again.content || '').trim();
+        if (!again.tool_calls?.length && text) {
+          reply = text;
+          bad = ungrounded(reply, evidenceText());
+        }
+      } catch (e) {
+        console.warn('[agent] correction ancrage ignorée :', safeError(e));
+      }
+      // Toujours pas ancrée : réponse construite par le code à partir de Neon uniquement
+      if (bad.length) reply = await groundedFallback(input.message, places, boatRows);
     }
   }
 
