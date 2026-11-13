@@ -23,7 +23,7 @@ import {
 import type { VerifyInput, VerifyResult } from '../routes/ai.js'; // types seulement : pas d'import circulaire
 
 const MAX_STEPS = Number(process.env.AI_MAX_STEPS ?? 6);
-const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY ?? 20);
+const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY ?? 10);
 const TZ = 'Indian/Antananarivo';
 
 // Réglages de conversation. Quota Groq limité (TPM) : raisonnement bas et réponses courtes
@@ -840,23 +840,26 @@ type ChatTools = Parameters<typeof chat>[1];
  * - les erreurs 429 de Groq (limite de tokens par minute) : on attend le délai indiqué par Groq.
  */
 async function chatWithRetry(turn: Msg[], defs: ChatTools, opts: ChatOptions) {
-  try {
-    return await chat(turn, defs, opts);
-  } catch (e) {
-    const msg = safeError(e);
-    const isTimeout = /timeout|timed out|abort|fetch failed|ECONN|socket/i.test(msg);
-    const is429 = /429|rate limit/i.test(msg);
-    if (!isTimeout && !is429) throw e;
+  const MAX_TRIES = 3;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await chat(turn, defs, opts);
+    } catch (e) {
+      const msg = safeError(e);
+      const isTimeout = /timeout|timed out|abort|fetch failed|ECONN|socket/i.test(msg);
+      const is429 = /429|rate limit/i.test(msg);
+      if ((!isTimeout && !is429) || attempt >= MAX_TRIES) throw e;
 
-    let wait = 1500;
-    if (is429) {
-      const m = msg.match(/try again in ([\d.]+)s/i);
-      wait = m ? Math.ceil(Number(m[1]) * 1000) + 500 : 8000;
-      if (wait > 20000) throw e; // attente trop longue : le secours répondra
+      let wait = 1500;
+      if (is429) {
+        // Groq indique le délai en secondes (« 8.79s ») ou en millisecondes (« 877.5ms »)
+        const m = msg.match(/try again in ([\d.]+)\s?(ms|s)\b/i);
+        wait = m ? Math.ceil(Number(m[1]) * (m[2].toLowerCase() === 'ms' ? 1 : 1000)) + 500 : 8000;
+        if (wait > 30000) throw e; // attente trop longue : le secours répondra
+      }
+      console.warn(`[agent] LLM : nouvelle tentative ${attempt}/${MAX_TRIES - 1} dans ${wait} ms`);
+      await sleep(wait);
     }
-    console.warn(`[agent] LLM : nouvelle tentative dans ${wait} ms (${msg.slice(0, 80)})`);
-    await sleep(wait);
-    return chat(turn, defs, opts);
   }
 }
 
@@ -984,7 +987,9 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
   }
 
   // Anti-répétition : si la réponse ressemble trop à la précédente, on demande une autre approche
-  if (!degraded && reply && lastAssistant && similarity(reply, lastAssistant) > 0.7) {
+  // Désactivée par défaut : chaque relance coûte un appel complet (~3 500 tokens) sur un quota de 8 000/min.
+  // Pour la réactiver : variable d'environnement AI_ANTI_REPEAT=1.
+  if (process.env.AI_ANTI_REPEAT === '1' && !degraded && reply && lastAssistant && similarity(reply, lastAssistant) > 0.7) {
     try {
       turn.push({ role: 'assistant', content: reply });
       turn.push({
