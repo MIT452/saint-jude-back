@@ -85,6 +85,9 @@ const REFUSAL_RE = /^(non|nan|non merci|pas du tout|pas maintenant|laisse tomber
 const YES_RE = /^(oui|ouais|yes|eny|ok|okay|d'accord|daccord|volontiers|bien sur|pourquoi pas)[\s.!]*$/;
 const THANKS_RE = /^(merci|ok merci|merci beaucoup|misaotra|misaotra betsaka|thanks|thank you|super|parfait)[\s.!]*$/;
 const WHY_RE = /^(pourq\w*|pourquoi\s*\??|why\??|nahoana\??|ahoana\??)[\s?.!]*$/;
+// « que peux-je faire alors ? », « et maintenant ? », « comment faire ? » : le client demande des options
+const ADVICE_RE =
+  /(que (peux|puis|dois)|que faire|quoi faire|je fais quoi|et alors|^alors\s*\??$|et maintenant|comment faire|inona no azoko atao|inona no atao)/;
 
 const wordSet = (s: string) => new Set(norm(s).split(/[^a-z0-9]+/).filter((w) => w.length > 2));
 
@@ -123,6 +126,10 @@ function turnHints(lastAssistant: string, current: string, hasPending: boolean):
   } else if (WHY_RE.test(t)) {
     hints.push(
       "Le client demande POURQUOI : explique ta dernière réponse avec les faits déjà obtenus (sans refaire d'appel inutile) et reste cohérent avec ce que tu as dit.",
+    );
+  } else if (ADVICE_RE.test(t)) {
+    hints.push(
+      "Le client demande QUOI FAIRE maintenant. Ne répète PAS le constat que tu as déjà fait (par exemple l'absence de départ) : il le sait. Réponds comme un conseiller, en une ou deux phrases naturelles : donne les vraies possibilités (essayer un autre port de départ ou d'arrivée parmi ceux qui ont des départs, choisir une autre date, ou revenir plus tard), puis demande laquelle l'intéresse. Si tu as besoin de savoir quels ports ont des départs, appelle prochains_voyages. N'énumère pas des lignes sans rapport avec sa demande.",
     );
   } else if (THANKS_RE.test(t)) {
     hints.push('Le client te remercie ou clôt l’échange : réponds en une courte phrase chaleureuse, sans relancer.');
@@ -182,6 +189,7 @@ RAISONNER COMME UNE PERSONNE (avant chaque réponse, réfléchis à ces points)
 4. Mon alternative a-t-elle un lien avec sa demande ? Une alternative utile garde le même port de départ ou le même port d'arrivée. Si le résultat de l'outil indique qu'il n'y a aucun départ sur le trajet demandé et que seules d'AUTRES lignes existent, dis-le honnêtement : ce n'est pas le trajet demandé. Ne la présente pas comme une solution et demande plutôt si le client peut changer de port, de date ou de marchandise.
 5. Suis-je cohérent ? Ne te contredis pas : si tu as dit qu'il n'y a pas de départ, n'affirme pas l'inverse sans nouvelle donnée. Ne repropose jamais une option que le client vient de refuser.
 6. Est-ce que ça vient des outils ? Tout chiffre, date, nom de bateau ou tarif vient d'un outil. Sinon, tu ne le dis pas.
+7. Ai-je déjà dit cette information ? Si oui, ne la répète pas : le client la connaît. Va directement à ce qui l'aide maintenant. Quand il demande « que faire alors ? », il veut des pistes concrètes, pas un rappel du problème.
 
 TON ET FAÇON DE PARLER
 - Parle comme à un client au guichet : phrases courtes, mots simples, vouvoiement, chaleureux sans excès. Pas de ton administratif, pas de « N'hésitez pas à… », pas de « Je suis là pour vous aider ».
@@ -409,7 +417,24 @@ const reservationToolDefs = [
 
 const RESERVATION_TOOLS = new Set(reservationToolDefs.map((d) => d.function.name));
 
-/** Départs à venir avec un lien logique avec la demande : exact, puis même départ, puis même arrivée, puis le reste du réseau. */
+/** Ports qui ont au moins un départ à venir (pour aider le client à choisir un autre port). */
+async function upcomingPorts(): Promise<{ depart: string[]; arrivee: string[] }> {
+  const { rows } = await pool.query(
+    `SELECT DISTINCT t."from" AS dep, t."to" AS dest
+       FROM trips t
+       LEFT JOIN boats b ON t."boatId" = b.id
+      WHERE t.depart::date >= $1::date
+        AND UPPER(COALESCE(t.status, '')) NOT LIKE 'ANNUL%'
+        AND ${BOAT_USABLE}
+      LIMIT 50`,
+    [todayIso()],
+  );
+  const dep = [...new Set(rows.map((r: Record<string, any>) => String(r.dep)))];
+  const arr = [...new Set(rows.map((r: Record<string, any>) => String(r.dest)))];
+  return { depart: dep, arrivee: arr };
+}
+
+/** Départs à venir avec un lien logique avec la demande : exact, puis même départ, puis même arrivée, puis les ports actifs. */
 async function tripsWithContext(depart: string | undefined, arrivee: string | undefined, limite: number) {
   const exact = await upcomingTrips({ depart, arrivee, limit: limite });
   if (exact.length) return { lien: 'trajet demandé', voyages: exact };
@@ -434,13 +459,14 @@ async function tripsWithContext(depart: string | undefined, arrivee: string | un
   }
 
   if (!related) {
-    const network = await upcomingTrips({ limit: 3 });
-    if (network.length) result.autres_lignes_sans_lien_avec_la_demande = network;
+    const ports = await upcomingPorts();
+    if (ports.depart.length) result.ports_avec_departs_a_venir = ports.depart;
+    if (ports.arrivee.length) result.ports_avec_arrivees_a_venir = ports.arrivee;
   }
 
   result.consigne = related
-    ? "Dis franchement qu'il n'y a pas de départ sur ce trajet, puis propose UNE option liée à la demande (même port de départ ou même port d'arrivée) et demande si elle convient."
-    : "Dis franchement qu'il n'y a pas de départ sur ce trajet. Les lignes listées n'ont AUCUN lien avec la demande : mentionne-les seulement comme information, sans les présenter comme une solution, puis demande si le client peut changer de port, de date ou de marchandise.";
+    ? "Si tu as déjà annoncé dans la conversation qu'il n'y a pas de départ sur ce trajet, ne le répète pas. Propose UNE option liée à la demande (même port de départ ou même port d'arrivée) et demande si elle convient."
+    : "Il n'y a aucun départ sur ce trajet et aucune ligne liée à la demande. Si tu l'as déjà dit dans la conversation, ne le répète pas. Ne cite aucune ligne précise. Pour aider, tu peux seulement nommer les ports qui ont des départs à venir (ports_avec_departs_a_venir) afin que le client choisisse un autre port, ou lui suggérer une autre date. Ne promets ni de programmer un voyage ni de le prévenir.";
   return result;
 }
 
