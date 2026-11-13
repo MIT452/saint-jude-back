@@ -3,6 +3,7 @@ import { Router, type NextFunction, type Request, type Response } from 'express'
 import crypto from 'node:crypto';
 import { pool } from '../db.js';
 import { formatReservationList } from '../utils/whatsappFormat.js';
+import { answerReservationQuestion } from '../utils/reservationQuestions.js';
 
 export const whatsappWebhookRouter = Router();
 
@@ -10,7 +11,7 @@ const GRAPH_VERSION = 'v25.0';
 const CONTEXT_TTL_MS = 30 * 60_000;
 const SEEN_TTL_MS = 10 * 60_000;
 const RATE_LIMIT_PER_MIN = 12;
-const MAX_MESSAGES = 4;
+const MAX_MESSAGES = 6; // 6 messages de 5 cartes au maximum par réponse
 
 // Secret généré à chaque démarrage : sert uniquement à l'appel interne vers /chat
 const INTERNAL_SECRET = crypto.randomBytes(24).toString('hex');
@@ -22,6 +23,8 @@ const APP_CONFIRM_MESSAGE =
 const ADMIN_ONLY_MESSAGE =
   '🔒 Cette information est réservée aux administrateurs. ' +
   'Votre numéro doit être enregistré dans votre profil Saint-Jude (champ téléphone) avec un rôle administrateur.';
+
+const LOOKUP_ERROR_MESSAGE = '⚠️ Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.';
 
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -82,8 +85,8 @@ function allowByRate(from: string): boolean {
 }
 
 /* =========================================================
-   Administrateurs : identifiés par leur numéro WhatsApp (signé par Meta)
-   Rôles acceptés : variable WHATSAPP_ADMIN_ROLES (séparés par des virgules),
+   Utilisateurs : identifiés par leur numéro WhatsApp (signé par Meta)
+   Rôles administrateur : variable WHATSAPP_ADMIN_ROLES (séparés par des virgules),
    sinon admin, administrateur, proprietaire, owner. Accents et majuscules ignorés.
 ========================================================= */
 const ADMIN_ROLES = (process.env.WHATSAPP_ADMIN_ROLES ?? 'admin,administrateur,proprietaire,owner')
@@ -91,25 +94,36 @@ const ADMIN_ROLES = (process.env.WHATSAPP_ADMIN_ROLES ?? 'admin,administrateur,p
   .map((r) => normalize(r))
   .filter(Boolean);
 
-/** Retourne l'administrateur si le numéro correspond à UN SEUL compte, dont le rôle est admin. */
-async function findAdminByPhone(from: string): Promise<{ name: string } | null> {
+interface KnownUser {
+  id: string;
+  name: string;
+  isAdmin: boolean;
+}
+
+/**
+ * Retourne le compte dont le numéro correspond (9 derniers chiffres), à condition qu'il n'y en ait
+ * qu'UN SEUL. Deux comptes avec le même numéro : refus (aucune élévation de droits possible).
+ */
+async function findUserByPhone(from: string): Promise<KnownUser | null> {
   const digits = from.replace(/\D/g, '');
   if (digits.length < 9) return null;
   const tail = digits.slice(-9);
 
   const { rows } = await pool.query(
-    `SELECT name, "lastName", role FROM "user"
+    `SELECT id, name, "lastName", role FROM "user"
      WHERE LENGTH(regexp_replace(COALESCE(tel, ''), '\\D', '', 'g')) >= 9
        AND RIGHT(regexp_replace(COALESCE(tel, ''), '\\D', '', 'g'), 9) = $1
      LIMIT 3`,
     [tail],
   );
-  // Deux comptes avec le même numéro : on refuse (aucune élévation de droits possible)
   if (rows.length !== 1) return null;
 
   const role = normalize(String(rows[0].role ?? ''));
-  if (!ADMIN_ROLES.includes(role)) return null;
-  return { name: `${rows[0].name ?? ''} ${rows[0].lastName ?? ''}`.trim() };
+  return {
+    id: String(rows[0].id),
+    name: `${rows[0].name ?? ''} ${rows[0].lastName ?? ''}`.trim(),
+    isAdmin: ADMIN_ROLES.includes(role),
+  };
 }
 
 /* =========================================================
@@ -117,6 +131,14 @@ async function findAdminByPhone(from: string): Promise<{ name: string } | null> 
    (lecture seule, sans téléphone ni e-mail)
 ========================================================= */
 const nbr = (n: number) => n.toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ');
+
+/** Limite le nombre de messages envoyés d'un coup. */
+function limitMessages(messages: string[]): string[] {
+  if (messages.length <= MAX_MESSAGES) return messages;
+  const kept = messages.slice(0, MAX_MESSAGES);
+  kept[MAX_MESSAGES - 1] += '\n\n… La suite est dans l’application Saint-Jude.';
+  return kept;
+}
 
 async function answerPendingReservations(): Promise<string[]> {
   const { rows } = await pool.query(
@@ -139,9 +161,7 @@ async function answerPendingReservations(): Promise<string[]> {
   const sum = rows.reduce((acc, r) => acc + (Number.isFinite(Number(r.totalPrice)) ? Number(r.totalPrice) : 0), 0);
 
   const footer =
-    total === rows.length
-      ? `💰 Montant total : *${nbr(sum)} Ar*`
-      : `📊 ${rows.length} sur ${total} affichées`;
+    total === rows.length ? `💰 Montant total : *${nbr(sum)} Ar*` : `📊 ${rows.length} sur ${total} affichées`;
 
   let messages = formatReservationList(
     rows.map((r) => ({
@@ -160,8 +180,7 @@ async function answerPendingReservations(): Promise<string[]> {
   );
 
   if (messages.length > MAX_MESSAGES) {
-    messages = messages.slice(0, MAX_MESSAGES);
-    messages[MAX_MESSAGES - 1] += '\n\n… La suite est dans l’application Saint-Jude.';
+    messages = limitMessages(messages);
   } else if (hidden > 0) {
     messages[messages.length - 1] += `\n\n… et ${hidden} autre(s) dans l’application Saint-Jude.`;
   }
@@ -217,20 +236,49 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     return;
   }
 
-  // « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
   const n = normalize(text);
+
+  // « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
   if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
-    let answers: string[] = ['⚠️ Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.'];
+    let answers: string[] = [LOOKUP_ERROR_MESSAGE];
     try {
-      const admin = await findAdminByPhone(from);
-      console.info(`[WhatsApp] réservations en attente demandées par ***${from.slice(-3)} : admin=${admin ? 'oui' : 'non'}`);
-      answers = admin ? await answerPendingReservations() : [ADMIN_ONLY_MESSAGE];
+      const user = await findUserByPhone(from);
+      const isAdmin = user?.isAdmin === true;
+      console.info(`[WhatsApp] réservations en attente demandées par ***${from.slice(-3)} : admin=${isAdmin ? 'oui' : 'non'}`);
+      answers = isAdmin ? await answerPendingReservations() : [ADMIN_ONLY_MESSAGE];
     } catch (err) {
       console.warn(`[WhatsApp] consultation des réservations impossible : ${(err as Error).message}`);
     }
     // Envoi dans l'ordre : chaque message attend la fin du précédent
     for (const part of answers) await sendText(from, part);
     return;
+  }
+
+  // Questions sur les réservations (« qui a fait réservation aujourd'hui ? », « combien… ») :
+  // réponse lue dans Neon, sans jamais lancer une nouvelle réservation. Admin : tout ;
+  // client : uniquement ses propres réservations. Les demandes de réservation passent plus bas.
+  if (/reserv/.test(n)) {
+    const user = await findUserByPhone(from).catch((err) => {
+      console.warn(`[WhatsApp] recherche du compte impossible : ${(err as Error).message}`);
+      return null;
+    });
+    try {
+      const answers = await answerReservationQuestion(text, {
+        id: user?.id ?? null,
+        isAdmin: user?.isAdmin === true,
+      });
+      if (answers) {
+        console.info(
+          `[WhatsApp] question réservations de ***${from.slice(-3)} : compte=${user ? 'oui' : 'non'} admin=${user?.isAdmin ? 'oui' : 'non'}`,
+        );
+        for (const part of limitMessages(answers)) await sendText(from, part);
+        return;
+      }
+    } catch (err) {
+      console.warn(`[WhatsApp] question réservations impossible : ${(err as Error).message}`);
+      await sendText(from, LOOKUP_ERROR_MESSAGE);
+      return;
+    }
   }
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
