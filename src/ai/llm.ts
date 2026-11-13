@@ -10,6 +10,14 @@ const ollamaModel = () => (process.env.OLLAMA_MODEL || 'llama3.2').trim();
 const groqModel = () => (process.env.GROQ_MODEL || 'openai/gpt-oss-20b').trim();
 const openaiModel = () => (process.env.OPENAI_MODEL || 'gpt-4o-mini').trim();
 
+// Chez Groq, la limite de tokens par minute (TPM) est comptée PAR MODÈLE.
+// Quand le modèle principal répond 429, on bascule tout de suite sur ce modèle de secours,
+// qui a son propre quota. Désactivation : GROQ_FALLBACK_MODEL=none
+const groqFallbackModel = (): string | null => {
+  const v = (process.env.GROQ_FALLBACK_MODEL || 'openai/gpt-oss-20b').trim();
+  return ['none', 'off'].includes(v.toLowerCase()) ? null : v;
+};
+
 export type ToolCall = { function: { name: string; arguments: Record<string, unknown> } };
 export type Msg = {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -63,15 +71,23 @@ export async function chat(messages: Msg[], tools?: unknown[], options: ChatOpti
   const provider = pickProvider();
 
   if (provider === 'groq') {
-    return chatOpenAICompat(
-      'https://api.groq.com/openai/v1',
-      (process.env.GROQ_API_KEY || '').trim(),
-      groqModel(),
-      'Groq',
-      messages,
-      tools,
-      options,
-    );
+    const baseUrl = 'https://api.groq.com/openai/v1';
+    const apiKey = (process.env.GROQ_API_KEY || '').trim();
+    const primary = groqModel();
+    const fallback = groqFallbackModel();
+    const hasFallback = Boolean(fallback && fallback !== primary);
+
+    try {
+      // Avec un modèle de secours, pas de réessai interne sur 429 : on bascule aussitôt.
+      return await chatOpenAICompat(baseUrl, apiKey, primary, 'Groq', messages, tools, options, !hasFallback);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (hasFallback && fallback && /répondu 429/.test(msg)) {
+        console.warn(`[llm] Groq 429 sur ${primary} : bascule sur ${fallback}`);
+        return chatOpenAICompat(baseUrl, apiKey, fallback, 'Groq', messages, tools, options, false);
+      }
+      throw e;
+    }
   }
 
   if (provider === 'openai') {
@@ -178,6 +194,7 @@ async function chatOpenAICompat(
   messages: Msg[],
   tools?: unknown[],
   options: ChatOptions = {},
+  retry429 = true,
 ): Promise<Msg> {
   const isReasoning = model.includes('gpt-oss');
   const level: ReasoningLevel = options.reasoning ?? 'low';
@@ -207,12 +224,10 @@ async function chatOpenAICompat(
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(60_000),
     });
-    // Une seule nouvelle tentative en cas de limite de débit ou d'erreur serveur passagère
-    if (res.status === 429 || res.status >= 500) {
-      if (attempt === 0) {
-        await sleep(1500);
-        continue;
-      }
+    // Une seule nouvelle tentative en cas d'erreur serveur passagère (et de limite de débit si retry429)
+    if ((res.status >= 500 || (retry429 && res.status === 429)) && attempt === 0) {
+      await sleep(1500);
+      continue;
     }
     break;
   }
