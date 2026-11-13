@@ -4,7 +4,7 @@
 // enregistrer une réservation : il prépare un brouillon, le client clique sur « Confirmer ».
 
 import { pool } from '../db.js';
-import { chat, safeError, type Msg } from './llm.js';
+import { chat, safeError, type ChatOptions, type Msg } from './llm.js';
 import { tools, toolDefs } from './tools.js';
 import { findRelevantTools } from './jit.js';
 import { defaultKnowledge, retrieveKnowledge } from './rag.js';
@@ -26,6 +26,13 @@ const MAX_STEPS = Number(process.env.AI_MAX_STEPS ?? 6);
 const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY ?? 20);
 const TZ = 'Indian/Antananarivo';
 
+// Réglages de conversation : un peu de variété (0.5) et un raisonnement moyen pour mieux suivre le fil
+const CHAT_OPTS: ChatOptions = {
+  temperature: Number(process.env.AI_TEMPERATURE ?? 0.5),
+  maxTokens: 500,
+  reasoning: 'medium',
+};
+
 /** Fonctions du backend injectées par la route (évite que agent.ts importe routes/ai.ts). */
 export interface AgentDeps {
   verifyTrip: (input: VerifyInput) => Promise<VerifyResult>;
@@ -39,6 +46,93 @@ interface Ctx {
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* =========================================================
+   Utilitaires de texte
+========================================================= */
+const norm = (s: string) =>
+  s
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[’‘]/g, "'")
+    .toLowerCase()
+    .trim();
+
+const nbr = (n: number) => n.toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ');
+
+/**
+ * Dernier filet de sécurité sur la réponse envoyée au client :
+ * - espaces fines / insécables (rendues presque invisibles par certaines polices) → espace normale
+ * - mots collés aux nombres (« tarif1500Ar/kg », « restantes4978 ») → espaces rétablies
+ * - grands nombres suivis d'une unité → « 1 500 Ar »
+ */
+function polish(text: string): string {
+  return text
+    .replace(/[\u202f\u00a0\u2009\u2007]/g, ' ')
+    .replace(/([A-Za-zÀ-ÿ]{2,})(\d)/g, '$1 $2')
+    .replace(/(\d)(Ar|kg|[A-Za-zÀ-ÿ]{3,})/g, '$1 $2')
+    .replace(/\b(\d{4,9})(?= (?:Ar|kg|tonnes?|places?)\b)/g, (n) => nbr(Number(n)))
+    .replace(/([.!?])(?=[A-ZÀ-ÝÉÈÊ])/g, '$1 ')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/* =========================================================
+   Compréhension du tour : le code aide le modèle à raisonner comme une personne
+========================================================= */
+const REFUSAL_RE = /^(non|nan|non merci|pas du tout|pas maintenant|laisse tomber|no|nope|tsia|tsy mila)[\s.!]*$/;
+const YES_RE = /^(oui|ouais|yes|eny|ok|okay|d'accord|daccord|volontiers|bien sur|pourquoi pas)[\s.!]*$/;
+const THANKS_RE = /^(merci|ok merci|merci beaucoup|misaotra|misaotra betsaka|thanks|thank you|super|parfait)[\s.!]*$/;
+const WHY_RE = /^(pourq\w*|pourquoi\s*\??|why\??|nahoana\??|ahoana\??)[\s?.!]*$/;
+
+const wordSet = (s: string) => new Set(norm(s).split(/[^a-z0-9]+/).filter((w) => w.length > 2));
+
+/** Part de mots communs entre deux textes (0 à 1), pour repérer une réponse répétée. */
+function similarity(a: string, b: string): number {
+  const A = wordSet(a);
+  const B = wordSet(b);
+  if (A.size < 6 || B.size < 6) return 0;
+  let common = 0;
+  for (const w of A) if (B.has(w)) common++;
+  return common / Math.min(A.size, B.size);
+}
+
+function lastAssistantText(messages: Msg[]): string {
+  const m = [...messages].reverse().find((x) => x.role === 'assistant');
+  return m ? String(m.content ?? '') : '';
+}
+
+/** Consignes propres à ce tour : ce que le message court du client veut dire par rapport à ta dernière réponse. */
+function turnHints(lastAssistant: string, current: string, hasPending: boolean): string {
+  const hints: string[] = [];
+  const t = norm(current);
+
+  if (lastAssistant) {
+    hints.push(
+      `Ta dernière réponse au client était :\n"""${lastAssistant.slice(0, 600)}"""\nNe la répète pas, ne repropose pas les mêmes options et change ta façon de commencer.`,
+    );
+  }
+
+  if (REFUSAL_RE.test(t)) {
+    hints.push(
+      hasPending
+        ? "Le client refuse le récapitulatif en cours. N'insiste pas : demande simplement ce qu'il veut changer (date, quantité, trajet) ou s'il préfère abandonner."
+        : "Le client REFUSE ta dernière proposition. N'insiste pas et ne la répète pas. Prends acte en quelques mots, sans dramatiser ni t'excuser, puis demande ce qui lui conviendrait mieux : un autre port, une autre date ou une autre marchandise. Ne propose pas une nouvelle ligne au hasard.",
+    );
+  } else if (WHY_RE.test(t)) {
+    hints.push(
+      "Le client demande POURQUOI : explique ta dernière réponse avec les faits déjà obtenus (sans refaire d'appel inutile) et reste cohérent avec ce que tu as dit.",
+    );
+  } else if (THANKS_RE.test(t)) {
+    hints.push('Le client te remercie ou clôt l’échange : réponds en une courte phrase chaleureuse, sans relancer.');
+  } else if (YES_RE.test(t)) {
+    hints.push(
+      "Si ta dernière réponse contenait une question ou une proposition, le client l'ACCEPTE : avance à l'étape suivante (demande seulement l'information qui manque encore pour la réservation). Sinon, c'est un simple accusé de réception.",
+    );
+  }
+  return hints.join('\n\n');
+}
 
 /* =========================================================
    Prompt système
@@ -59,6 +153,7 @@ function buildSystemPrompt(
   documents: string,
   boatsData = '',
   firstName: string | null = null,
+  hints = '',
 ): string {
   const p = ctx.conv.pending;
   const pendingText = p
@@ -70,34 +165,38 @@ function buildSystemPrompt(
     : '';
 
   const clientText = firstName
-    ? `\nLe client s'appelle ${firstName}. Utilise son prénom de temps en temps (salutation, remerciement), jamais à chaque phrase.`
+    ? `\nLe client s'appelle ${firstName}. Utilise son prénom rarement : une fois à l'accueil, éventuellement au remerciement final, jamais dans deux réponses de suite.`
     : '';
+
+  const hintsText = hints ? `\n\nCONSIGNES POUR CE TOUR\n${hints}` : '';
 
   return `Tu es l'assistant de Saint-Jude, entreprise de transport maritime à Madagascar. Tu parles comme un conseiller de comptoir aimable, qui connaît bien son métier : naturel, simple, posé. Tu aides les clients à consulter les voyages, les tarifs et les bateaux, et à préparer des réservations de marchandises. Si on te demande si tu es un humain, réponds simplement que tu es l'assistant virtuel de Saint-Jude.
 
 DATE : aujourd'hui nous sommes le ${todayLong()} (${todayIso()}), fuseau de Madagascar.
 PORTS CONNUS : ${places.join(', ') || 'aucun'}.${clientText}
 
-TON ET FAÇON DE PARLER
-- Parle comme à un client au guichet : phrases courtes, mots simples, vouvoiement. Pas de ton administratif, pas de « N'hésitez pas à… », pas de « Je suis là pour vous aider ».
-- Réagis d'abord à ce que le client vient de dire (« Très bien », « D'accord », « Compris », « Parfait »), puis avance. Varie ces débuts d'une réponse à l'autre : ne commence jamais deux réponses de suite par le même mot.
-- Réponds à la question posée AVANT de poser la tienne.
-- Si le client semble contrarié, déçu ou pressé, reconnais-le en une demi-phrase (« Je comprends, c'est embêtant. ») avant de proposer une solution.
-- Quand c'est impossible (pas de voyage, bateau indisponible), dis-le franchement, explique en quelques mots pourquoi, puis propose TOUJOURS une alternative concrète tirée des données (prochains départs réels, autre bateau). Ne demande jamais au client de deviner une date au hasard : appelle prochains_voyages.
-- Les messages courts ou avec des fautes (« pourq », « bato », « combient ») : devine le sens le plus probable à partir de la conversation. « Pourquoi ? » veut dire : explique ta dernière réponse avec les données déjà obtenues. Si le sens reste vraiment incertain, demande gentiment de préciser.
-- Pose UNE seule question à la fois, seulement si elle est nécessaire. Ne redemande JAMAIS une information déjà donnée et ne répète jamais une question déjà posée.
-- Pas d'emoji, sauf si le client en utilise.
+RAISONNER COMME UNE PERSONNE (avant chaque réponse, réfléchis à ces points)
+1. Que veut vraiment le client ? Relis ses derniers messages. Une réponse courte (« non », « oui », « ok », « pourquoi ») répond à TA dernière question ou proposition : elle l'accepte, la refuse ou demande une explication.
+2. Qu'est-ce que je sais déjà ? Ce que le client a déjà dit (marchandise, ports, poids, date) ne se redemande jamais.
+3. Qu'est-ce que je ne sais pas ? Ne suppose jamais une date : si le client n'en a pas donné, ne parle pas de « aujourd'hui » et ne dis pas « aucun départ aujourd'hui ». Appelle prochains_voyages sur son trajet pour voir tous les départs à venir.
+4. Mon alternative a-t-elle un lien avec sa demande ? Une alternative utile garde le même port de départ ou le même port d'arrivée. Si le résultat de l'outil indique qu'il n'y a aucun départ sur le trajet demandé et que seules d'AUTRES lignes existent, dis-le honnêtement : ce n'est pas le trajet demandé. Ne la présente pas comme une solution et demande plutôt si le client peut changer de port, de date ou de marchandise.
+5. Suis-je cohérent ? Ne te contredis pas : si tu as dit qu'il n'y a pas de départ, n'affirme pas l'inverse sans nouvelle donnée. Ne repropose jamais une option que le client vient de refuser.
+6. Est-ce que ça vient des outils ? Tout chiffre, date, nom de bateau ou tarif vient d'un outil. Sinon, tu ne le dis pas.
 
-EXEMPLES DE TON (à imiter pour la manière, jamais pour le contenu : ne recopie ni nom, ni chiffre)
-- Client : « salut » → « Bonjour ! Qu'est-ce que vous souhaitez envoyer aujourd'hui ? »
-- Client : « pourquoi ? » après un « pas de voyage » → « Parce qu'aucun départ n'est programmé sur ce trajet pour le moment. Voici les prochains départs que j'ai trouvés… » (puis tu appelles prochains_voyages et tu présentes les vrais résultats).
-- Client : « c'est trop cher » → « Je comprends. Le tarif dépend du poids et du trajet. On peut regarder une autre date pour comparer, si vous voulez. »
-- Client : « ok merci » → « Avec plaisir ! Si vous avez besoin d'autre chose, dites-moi. »
+TON ET FAÇON DE PARLER
+- Parle comme à un client au guichet : phrases courtes, mots simples, vouvoiement, chaleureux sans excès. Pas de ton administratif, pas de « N'hésitez pas à… », pas de « Je suis là pour vous aider ».
+- Réponds d'abord à ce que le client demande, puis, seulement si c'est nécessaire, pose UNE question. Une réponse sans question est parfaitement normale.
+- Varie tes débuts de phrase et ta longueur : parfois une seule phrase, parfois deux. Ne commence jamais deux réponses de suite par le même mot (« Très bien », « D'accord », « Je comprends »…) et évite le schéma « constat + alternative + question » à chaque message.
+- N'exprime de l'empathie (« c'est embêtant ») que si le client montre une vraie gêne, une déception ou de l'impatience. Un simple « non » n'est pas une gêne.
+- Quand c'est impossible (pas de voyage, bateau indisponible), dis-le franchement, explique en quelques mots pourquoi, puis propose une alternative concrète tirée des données si elle a un lien avec la demande (voir point 4).
+- Messages courts ou avec des fautes (« pourq », « bato », « combient ») : devine le sens le plus probable à partir de la conversation. Si le sens reste vraiment incertain, demande gentiment de préciser.
+- Comportements attendus, à exprimer avec tes propres mots à chaque fois (ne recopie jamais une phrase d'un message précédent) : une salutation → tu salues brièvement et tu demandes ce que le client veut envoyer ; un remerciement → une courte phrase aimable ; un reproche sur le prix → tu expliques que le tarif dépend du poids et du trajet et tu proposes de comparer une autre date.
+- Pas d'emoji, sauf si le client en utilise.
 
 LANGUE ET MISE EN FORME
 - Réponds dans la langue du client (français, malgache ou anglais). Si le message est mélangé, prends la langue dominante.
 - 1 à 3 phrases courtes. Pour énumérer des bateaux, des voyages ou des réservations : une liste avec « - », un élément par ligne, le nom en **gras**, puis le détail, par exemple « - **Arcanum** : 5 000 tonnes, Disponible ».
-- Mets toujours une espace entre les mots et les nombres (« 5 000 tonnes », jamais « 5000tonnes »).
+- Écris toujours des espaces normales entre les mots et les nombres : « un tarif de 1 500 Ar/kg », « il reste 4 978 places ». Jamais « tarif1500Ar/kg » ni « restantes4978 ».
 - Les montants sont en Ariary (Ar). Entana = marchandise, kilao = kg, eny = oui, tsia = non.
 
 CONVERSATION
@@ -119,7 +218,7 @@ RÈGLES STRICTES
 - Tu ne peux PAS enregistrer une réservation. preparer_reservation crée seulement un récapitulatif ; le client doit cliquer sur le bouton « Confirmer ». Ne dis JAMAIS qu'une réservation est enregistrée, et ne prétends jamais l'avoir annulée.
 - Tu ne gères que le transport de marchandises. Pour un billet passager, explique poliment que ce n'est pas encore possible par le chat.
 - Si un outil renvoie une erreur ou aucun résultat, dis-le honnêtement et propose une alternative (autre date, autre trajet).
-- Si la question n'a aucun rapport avec le transport maritime, dis-le poliment et brièvement.${pendingText}
+- Si la question n'a aucun rapport avec le transport maritime, dis-le poliment et brièvement.${pendingText}${hintsText}
 
 ${boatsText}Contexte documentaire (à utiliser seulement s'il est pertinent) :
 ${documents || 'Aucun document pertinent.'}`;
@@ -130,7 +229,6 @@ ${documents || 'Aucun document pertinent.'}`;
 ========================================================= */
 const likeParam = (s: string) => `%${s.trim().toLowerCase().replace(/[\\%_]/g, '\\$&')}%`;
 const frDate = (iso: string) => iso.split('-').reverse().join('/');
-const nbr = (n: number) => n.toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ');
 
 // Bateau utilisable : ni en maintenance, ni hors service, ni désarmé, ni en construction
 const BOAT_USABLE = `(b.id IS NULL OR (
@@ -243,7 +341,7 @@ const reservationToolDefs = [
     function: {
       name: 'prochains_voyages',
       description:
-        "Liste les prochains départs réels (date, heure, navire, tarif, places restantes), éventuellement entre deux ports. À appeler quand le client demande les voyages à venir, ou quand aucun voyage n'existe à la date demandée, pour lui proposer de vrais départs. Si le trajet n'a aucun départ, le résultat propose les autres départs depuis ce port ou les autres lignes.",
+        "Liste les prochains départs réels (date, heure, navire, tarif, places restantes), éventuellement entre deux ports. À appeler quand le client demande les voyages à venir, quand il n'a donné aucune date, ou quand aucun voyage n'existe à la date demandée. Si le trajet n'a aucun départ, le résultat indique les départs qui ont un lien avec la demande (même port de départ ou même port d'arrivée) ou, à défaut, d'autres lignes sans lien.",
       parameters: {
         type: 'object',
         properties: {
@@ -311,6 +409,41 @@ const reservationToolDefs = [
 
 const RESERVATION_TOOLS = new Set(reservationToolDefs.map((d) => d.function.name));
 
+/** Départs à venir avec un lien logique avec la demande : exact, puis même départ, puis même arrivée, puis le reste du réseau. */
+async function tripsWithContext(depart: string | undefined, arrivee: string | undefined, limite: number) {
+  const exact = await upcomingTrips({ depart, arrivee, limit: limite });
+  if (exact.length) return { lien: 'trajet demandé', voyages: exact };
+
+  const result: Record<string, unknown> = {
+    voyages: [],
+    message: 'Aucun départ à venir sur le trajet demandé.',
+  };
+
+  let related = false;
+  if (depart && arrivee) {
+    const sameFrom = await upcomingTrips({ depart, limit: 3 });
+    if (sameFrom.length) {
+      result.meme_port_de_depart = sameFrom;
+      related = true;
+    }
+    const sameTo = await upcomingTrips({ arrivee, limit: 3 });
+    if (sameTo.length) {
+      result.meme_port_d_arrivee = sameTo;
+      related = true;
+    }
+  }
+
+  if (!related) {
+    const network = await upcomingTrips({ limit: 3 });
+    if (network.length) result.autres_lignes_sans_lien_avec_la_demande = network;
+  }
+
+  result.consigne = related
+    ? "Dis franchement qu'il n'y a pas de départ sur ce trajet, puis propose UNE option liée à la demande (même port de départ ou même port d'arrivée) et demande si elle convient."
+    : "Dis franchement qu'il n'y a pas de départ sur ce trajet. Les lignes listées n'ont AUCUN lien avec la demande : mentionne-les seulement comme information, sans les présenter comme une solution, puis demande si le client peut changer de port, de date ou de marchandise.";
+  return result;
+}
+
 async function runReservationTool(name: string, a: Record<string, unknown>, ctx: Ctx): Promise<unknown> {
   if (name === 'convertir_date') {
     const r = ctx.deps.parseRelativeDate(String(a.texte ?? ''));
@@ -322,20 +455,7 @@ async function runReservationTool(name: string, a: Record<string, unknown>, ctx:
     const depart = asText(a.depart);
     const arrivee = asText(a.arrivee);
     const limite = a.limite === undefined ? 5 : (asNum(a.limite, 10) ?? 5);
-
-    const voyages = await upcomingTrips({ depart, arrivee, limit: limite });
-    if (voyages.length) return { voyages };
-
-    const result: Record<string, unknown> = { voyages: [], message: 'Aucun départ à venir sur ce trajet.' };
-    if (depart && arrivee) {
-      const fromPort = await upcomingTrips({ depart, limit: 3 });
-      if (fromPort.length) result.autres_departs_depuis_ce_port = fromPort;
-    }
-    if (!result.autres_departs_depuis_ce_port) {
-      const network = await upcomingTrips({ limit: 3 });
-      if (network.length) result.autres_lignes_disponibles = network;
-    }
-    return result;
+    return tripsWithContext(depart, arrivee, limite);
   }
 
   if (name === 'choisir_mode_paiement') {
@@ -385,7 +505,7 @@ async function runReservationTool(name: string, a: Record<string, unknown>, ctx:
       : {
           disponible: false,
           message: result.message,
-          conseil: 'Appelle prochains_voyages pour proposer de vrais départs au client.',
+          conseil: 'Appelle prochains_voyages (avec les deux ports) pour proposer de vrais départs au client.',
         };
   }
 
@@ -398,7 +518,7 @@ async function runReservationTool(name: string, a: Record<string, unknown>, ctx:
     return {
       disponible: false,
       message: result.message,
-      conseil: 'Appelle prochains_voyages pour proposer de vrais départs au client.',
+      conseil: 'Appelle prochains_voyages (avec les deux ports) pour proposer de vrais départs au client.',
     };
   }
 
@@ -450,16 +570,6 @@ export interface AgentOutput {
   pending: ReturnType<typeof publicPending>;
 }
 
-/* =========================================================
-   Réponse « bateaux » calculée par le code (le modèle ne peut pas se tromper)
-========================================================= */
-const norm = (s: string) =>
-  s
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .trim();
-
 /** Détecte le mode de paiement dit par le client (null si absent ou ambigu). */
 function detectPayment(message: string): PaymentMethod | null {
   const t = norm(message);
@@ -481,7 +591,7 @@ const boatLine = (b: BoatRow) => {
 };
 
 function boatsReply(rows: BoatRow[], message: string): string {
-  if (!rows.length) return "Je ne vois aucun bateau enregistré pour le moment.";
+  if (!rows.length) return 'Je ne vois aucun bateau enregistré pour le moment.';
   const wantsAvailable = /dispo/.test(norm(message));
   if (!wantsAvailable) {
     const head = rows.length === 1 ? 'Nous avons un bateau :' : `Voici nos ${rows.length} bateaux :`;
@@ -531,7 +641,9 @@ async function fallbackReply(
 
       if (trips.length === 0) {
         trips = await upcomingTrips({ limit: 3 });
-        note = mentioned.length ? " Je ne vois aucun départ à venir sur ce trajet. Voici les prochains départs sur nos autres lignes :" : '';
+        note = mentioned.length
+          ? ' Je ne vois aucun départ à venir sur ce trajet. Voici les prochains départs sur nos autres lignes :'
+          : '';
       }
       if (trips.length) {
         const intro = note || ' Voici les prochains départs que je trouve dans notre base :';
@@ -563,15 +675,18 @@ async function getFirstName(userId: string | null): Promise<string | null> {
 
 type ChatTools = Parameters<typeof chat>[1];
 
-/** Un appel au modèle, avec une seule nouvelle tentative pour les pannes passagères (limite, délai, réseau). */
-async function chatWithRetry(turn: Msg[], defs: ChatTools) {
+/**
+ * Un appel au modèle. llm.ts réessaie déjà les erreurs 429 et 5xx ;
+ * on réessaie ici une fois les coupures réseau et les délais dépassés.
+ */
+async function chatWithRetry(turn: Msg[], defs: ChatTools, opts: ChatOptions) {
   try {
-    return await chat(turn, defs);
+    return await chat(turn, defs, opts);
   } catch (e) {
-    if (!/429|rate|timeout|timed out|abort|fetch failed|ECONN|\b5\d\d\b/i.test(safeError(e))) throw e;
+    if (!/timeout|timed out|abort|fetch failed|ECONN|socket/i.test(safeError(e))) throw e;
     console.warn(`[agent] LLM : nouvelle tentative après « ${safeError(e)} »`);
     await sleep(1500);
-    return chat(turn, defs);
+    return chat(turn, defs, opts);
   }
 }
 
@@ -624,7 +739,7 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
 
   // Réponse directe : liste/disponibilité des bateaux, sans réservation en cours
   if (boatRows && !conv.pending && !BOOKING_WORDS.test(norm(input.message))) {
-    const direct = boatsReply(boatRows, input.message);
+    const direct = polish(boatsReply(boatRows, input.message));
     conv.messages.push({ role: 'assistant', content: direct });
     await saveConv(conv);
     console.log(JSON.stringify({ ai: 'direct', conv: conv.id, boats: boatRows.length }));
@@ -633,9 +748,13 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
 
   const availableTools = [...toolDefs.filter((d) => relevant.has(d.function.name)), ...reservationToolDefs];
 
+  // Consignes de ce tour : que veut dire un « non » ou un « pourquoi » par rapport à ma dernière réponse
+  const lastAssistant = lastAssistantText(conv.messages);
+  const hints = turnHints(lastAssistant, input.message, Boolean(conv.pending));
+
   // Les échanges d'outils vivent seulement dans ce tour ; l'historique stocké reste du texte propre.
   const turn: Msg[] = [
-    { role: 'system', content: buildSystemPrompt(ctx, places, docText, boatsData, firstName) },
+    { role: 'system', content: buildSystemPrompt(ctx, places, docText, boatsData, firstName, hints) },
     ...trim(conv.messages, MAX_HISTORY),
   ];
 
@@ -643,17 +762,26 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
   const used: string[] = [];
   let reply = '';
   let degraded = false;
+  let emptyRetried = false;
+  let opts: ChatOptions = { ...CHAT_OPTS };
 
   try {
     for (let step = 0; step < MAX_STEPS; step++) {
-      const out = await chatWithRetry(turn, availableTools);
-      turn.push(out);
+      const out = await chatWithRetry(turn, availableTools, opts);
 
       if (!out.tool_calls?.length) {
-        reply = (out.content || '').trim();
+        const text = (out.content || '').trim();
+        // Réponse vide (le raisonnement a consommé tous les tokens) : une nouvelle tentative avec plus de marge
+        if (!text && !emptyRetried) {
+          emptyRetried = true;
+          opts = { ...opts, maxTokens: (opts.maxTokens ?? 500) * 2 };
+          continue;
+        }
+        reply = text;
         break;
       }
 
+      turn.push(out);
       for (const call of out.tool_calls) {
         const name = call.function.name;
         used.push(name);
@@ -676,13 +804,30 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
     reply = await fallbackReply(input.message, places, Boolean(conv.pending), boatRows);
   }
 
+  // Anti-répétition : si la réponse ressemble trop à la précédente, on demande une autre approche
+  if (!degraded && reply && lastAssistant && similarity(reply, lastAssistant) > 0.7) {
+    try {
+      turn.push({ role: 'assistant', content: reply });
+      turn.push({
+        role: 'user',
+        content:
+          "[Consigne interne] Ta réponse ressemble trop à la précédente. Réécris-la autrement : n'écris pas les mêmes options, ne reprends pas la même ouverture, ne pose pas la même question. Si le client a refusé ta proposition, demande ce qu'il préfère. Réponds uniquement par le nouveau message pour le client.",
+      });
+      const again = await chatWithRetry(turn, undefined, { ...CHAT_OPTS, temperature: 0.7 });
+      const text = (again.content || '').trim();
+      if (!again.tool_calls?.length && text) reply = text;
+    } catch (e) {
+      console.warn('[agent] anti-répétition ignorée :', safeError(e));
+    }
+  }
+
   if (!reply) reply = "Je n'ai pas pu terminer la demande. Pouvez-vous la reformuler ?";
 
   if (!degraded) {
     // Garde-fou : l'IA ne peut jamais annoncer un enregistrement (seule la route /confirm le fait)
     if (/\b(enregistr[ée]e?|r[ée]serv[ée]e?)\b/i.test(reply) && /(c'est fait|a [ée]t[ée]|est bien|ai (bien )?enregistr)/i.test(reply)) {
       reply = conv.pending
-        ? "Votre réservation est prête mais pas encore enregistrée : cliquez sur « Confirmer » pour la valider."
+        ? 'Votre réservation est prête mais pas encore enregistrée : cliquez sur « Confirmer » pour la valider.'
         : "Rien n'a été enregistré pour le moment. Dites-moi ce que vous souhaitez envoyer.";
     }
 
@@ -692,6 +837,8 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
       reply = `${reply}\n\nComment souhaitez-vous payer : **Caisse**, **Banque** ou **Crédit** ?`.trim();
     }
   }
+
+  reply = polish(reply);
 
   conv.messages.push({ role: 'assistant', content: reply });
   await saveConv(conv);
@@ -731,7 +878,7 @@ export async function runOneShotAgent(question: string): Promise<string> {
   for (let tour = 0; tour < 5; tour++) {
     const reply = await chat(messages, availableToolDefs);
     messages.push(reply);
-    if (!reply.tool_calls?.length) return reply.content;
+    if (!reply.tool_calls?.length) return polish(reply.content);
 
     for (const call of reply.tool_calls) {
       const name = call.function.name;

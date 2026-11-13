@@ -18,11 +18,18 @@ export type Msg = {
   tool_name?: string;
 };
 
+export type ReasoningLevel = 'low' | 'medium' | 'high';
+
 export interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
   /** true = sortie JSON stricte (extraction). false/absent = texte libre. */
   json?: boolean;
+  /**
+   * Effort de raisonnement des modèles « gpt-oss » (ignoré par les autres modèles).
+   * low = rapide (extraction), medium = conversation qui suit bien le fil.
+   */
+  reasoning?: ReasoningLevel;
 }
 
 type Provider = 'ollama' | 'groq' | 'openai';
@@ -160,6 +167,9 @@ function toOpenAIMessages(messages: Msg[]) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Tokens supplémentaires réservés au raisonnement (il consomme aussi le budget de sortie)
+const REASONING_BUDGET: Record<ReasoningLevel, number> = { low: 400, medium: 900, high: 1500 };
+
 async function chatOpenAICompat(
   baseUrl: string,
   apiKey: string,
@@ -170,14 +180,15 @@ async function chatOpenAICompat(
   options: ChatOptions = {},
 ): Promise<Msg> {
   const isReasoning = model.includes('gpt-oss');
+  const level: ReasoningLevel = options.reasoning ?? 'low';
 
   const body: Record<string, unknown> = {
     model,
     messages: toOpenAIMessages(messages),
     temperature: options.temperature ?? 0.2,
     // les modèles gpt-oss « réfléchissent » : leur raisonnement consomme aussi des tokens
-    max_tokens: (options.maxTokens ?? 700) + (isReasoning ? 400 : 0),
-    ...(isReasoning ? { reasoning_effort: 'low' } : {}),
+    max_tokens: (options.maxTokens ?? 700) + (isReasoning ? REASONING_BUDGET[level] : 0),
+    ...(isReasoning ? { reasoning_effort: level } : {}),
   };
   if (options.json) body.response_format = { type: 'json_object' };
   if (tools?.length) {
