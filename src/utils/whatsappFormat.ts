@@ -1,6 +1,6 @@
 // src/utils/whatsappFormat.ts
 // Mise en forme stylisée des réservations pour WhatsApp (gras *...*, icônes par statut).
-// Renvoie une liste de messages : WhatsApp limite un message à ~4096 caractères.
+// Renvoie une liste de messages courts : au-delà de quelques lignes, WhatsApp affiche « Read more ».
 
 export interface ReservationLine {
   id: string;
@@ -20,7 +20,8 @@ export interface FormatOptions {
   defaultStatus?: string; // statut utilisé si la ligne n'en a pas
   emptyText?: string;
   footer?: string;
-  maxChars?: number; // taille maximale d'un message (3500 par défaut)
+  maxChars?: number; // taille maximale d'un message (1200 par défaut)
+  cardsPerMessage?: number; // nombre maximal de cartes par message (5 par défaut)
   hotAmount?: number; // à partir de ce montant (Ar) : 🔥 (1 000 000 par défaut)
   highAmount?: number; // à partir de ce montant (Ar) : 💎 (500 000 par défaut)
   showTotal?: boolean; // ajoute le montant total dans l'en-tête
@@ -31,12 +32,24 @@ const SEPARATOR = '━━━━━━━━━━━━━━';
 
 const plain = (s: string) => s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
+// Retire les caractères qui casseraient la mise en forme WhatsApp (* _ ~ `)
+const clean = (s: unknown) => String(s ?? '').replace(/[*_~`]/g, '').trim();
+
+// Espaces insécables (toLocaleString fr-FR) remplacés par de vrais espaces
+const nbr = (n: number) => n.toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ');
+
+const toNum = (v: unknown): number | null => {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
 // L'ordre compte : « en attente de confirmation » doit être reconnu comme « en attente »
 const STATUSES: Array<{ re: RegExp; icon: string; label: string }> = [
   { re: /annul/, icon: '❌', label: 'Annulée' },
   { re: /refus|rejet/, icon: '🚫', label: 'Refusée' },
   { re: /attente|pending|valider/, icon: '⏳', label: 'En attente' },
-  { re: /confirm|valid/, icon: '✅', label: 'Confirmée' },
+  { re: /confirm|\bvalid/, icon: '✅', label: 'Confirmée' },
   { re: /termin|livr|complet/, icon: '🏁', label: 'Terminée' },
 ];
 
@@ -46,29 +59,27 @@ function statusOf(status?: string | null) {
   return STATUSES.find((s) => s.re.test(k)) ?? { icon: '📌', label: clean(status) };
 }
 
-// Espaces insécables (toLocaleString fr-FR) remplacés par de vrais espaces
-const nbr = (n: number) => n.toLocaleString('fr-FR').replace(/[\u202f\u00a0]/g, ' ');
-
-// Retire les caractères qui casseraient la mise en forme WhatsApp (* _ ~ `)
-const clean = (s: unknown) => String(s ?? '').replace(/[*_~`]/g, '').trim();
-
-const toNum = (v: unknown): number | null => {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-};
+const dayInTz = (d: Date) => new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE }).format(d);
 
 /** Date du jour à Madagascar, au format AAAA-MM-JJ. */
-const todayIso = () => new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE }).format(new Date());
+const todayIso = () => dayInTz(new Date());
 
-/** Convertit une date (texte ou Date) en AAAA-MM-JJ, ou null si illisible. */
+/** Convertit une date (texte ou Date) en AAAA-MM-JJ (jour de Madagascar), ou null si illisible. */
 function toIso(d?: string | Date | null): string | null {
   if (!d) return null;
-  if (d instanceof Date) {
-    return Number.isNaN(d.getTime()) ? null : new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE }).format(d);
+  if (d instanceof Date) return Number.isNaN(d.getTime()) ? null : dayInTz(d);
+
+  const s = String(d).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  if (/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(s)) {
+    // Avec fuseau (Z ou +hh:mm) : on convertit vers le jour de Madagascar
+    if (/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s)) {
+      const parsed = new Date(s);
+      return Number.isNaN(parsed.getTime()) ? s.slice(0, 10) : dayInTz(parsed);
+    }
+    return s.slice(0, 10); // heure locale sans fuseau : on garde le jour tel quel
   }
-  const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/);
-  return m ? `${m[1]}-${m[2]}-${m[3]}` : null;
+  return null;
 }
 
 const frDate = (iso: string) => iso.split('-').reverse().join('/');
@@ -79,7 +90,7 @@ function dateLine(d?: string | Date | null): string {
   if (!iso) return `📅 ${d ? clean(d) : '-'}`;
 
   const today = todayIso();
-  const tomorrow = new Intl.DateTimeFormat('en-CA', { timeZone: TIMEZONE }).format(new Date(Date.now() + 86_400_000));
+  const tomorrow = dayInTz(new Date(Date.now() + 86_400_000));
 
   let tag = '';
   if (iso < today) tag = '  ⚠️ passé';
@@ -136,10 +147,11 @@ export function formatReservationCard(r: ReservationLine, opts: FormatOptions = 
   return lines.join('\n');
 }
 
-/** Liste complète, découpée en messages de taille raisonnable. */
+/** Liste complète, découpée en messages courts. */
 export function formatReservationList(items: ReservationLine[], opts: FormatOptions = {}): string[] {
   const title = opts.title ?? 'Réservations';
-  const max = Math.min(opts.maxChars ?? 3500, 3900);
+  const max = Math.min(opts.maxChars ?? 1200, 3900);
+  const perMessage = Math.max(1, opts.cardsPerMessage ?? 5);
 
   if (items.length === 0) return [opts.emptyText ?? `😌 *${title}*\nAucune réservation pour le moment.`];
 
@@ -150,7 +162,7 @@ export function formatReservationList(items: ReservationLine[], opts: FormatOpti
   }
 
   const header = (suite: boolean) =>
-    `📋 *${title}* (${items.length})${suite ? ' · suite' : ''}${suite ? '' : summary}\n${SEPARATOR}`;
+    `📋 *${title}* (${items.length})${suite ? ' · suite' : summary}\n${SEPARATOR}`;
 
   const messages: string[] = [];
   let current = header(false);
@@ -158,7 +170,7 @@ export function formatReservationList(items: ReservationLine[], opts: FormatOpti
 
   for (const r of items) {
     const card = formatReservationCard(r, opts);
-    if (cardsInCurrent > 0 && current.length + card.length + 2 > max) {
+    if (cardsInCurrent > 0 && (cardsInCurrent >= perMessage || current.length + card.length + 2 > max)) {
       messages.push(current);
       current = header(true);
       cardsInCurrent = 0;
