@@ -26,11 +26,12 @@ const MAX_STEPS = Number(process.env.AI_MAX_STEPS ?? 6);
 const MAX_HISTORY = Number(process.env.AI_MAX_HISTORY ?? 20);
 const TZ = 'Indian/Antananarivo';
 
-// Réglages de conversation : un peu de variété (0.5) et un raisonnement moyen pour mieux suivre le fil
+// Réglages de conversation. Quota Groq limité (TPM) : raisonnement bas et réponses courtes
+// pour consommer moins de tokens par appel.
 const CHAT_OPTS: ChatOptions = {
   temperature: Number(process.env.AI_TEMPERATURE ?? 0.5),
-  maxTokens: 500,
-  reasoning: 'medium',
+  maxTokens: 350,
+  reasoning: 'low',
 };
 
 /** Fonctions du backend injectées par la route (évite que agent.ts importe routes/ai.ts). */
@@ -108,7 +109,7 @@ function timeKeys(text: string): Set<string> {
 /** Nombres (chiffres seuls) présents dans un texte, avec ou sans espaces de milliers. */
 function numberSet(text: string): Set<string> {
   const out = new Set<string>();
-  for (const m of text.matchAll(/\d[\d   ]*\d|\d/g)) out.add(m[0].replace(/\D/g, ''));
+  for (const m of text.matchAll(/\d[\d\u202f\u00a0 ]*\d|\d/g)) out.add(m[0].replace(/\D/g, ''));
   for (const m of text.matchAll(/\d+/g)) out.add(m[0]);
   return out;
 }
@@ -128,8 +129,8 @@ function ungrounded(reply: string, evidence: string): string[] {
   for (const k of dateKeys(reply)) if (!okDates.has(k)) bad.add(`la date ${k}`);
   for (const k of timeKeys(reply)) if (!okTimes.has(k)) bad.add(`l'heure ${k.replace(':', ' h ')}`);
 
-  const numAfter = /(\d[\d   ]*\d)\s?(Ar|places?|tonnes?)\b/gi;
-  const numBefore = /(?:restantes?|restent|reste|capacit[eé]|tarif|prix)\s*(?:de|:)?\s*(\d[\d   ]*\d)/gi;
+  const numAfter = /(\d[\d\u202f\u00a0 ]*\d)\s?(Ar|places?|tonnes?)\b/gi;
+  const numBefore = /(?:restantes?|restent|reste|capacit[eé]|tarif|prix)\s*(?:de|:)?\s*(\d[\d\u202f\u00a0 ]*\d)/gi;
   for (const re of [numAfter, numBefore]) {
     for (const m of reply.matchAll(re)) {
       const digits = m[1].replace(/\D/g, '');
@@ -201,7 +202,7 @@ function turnHints(lastAssistant: string, current: string, hasPending: boolean):
     hints.push('Le client te remercie ou clôt l’échange : réponds en une courte phrase chaleureuse, sans relancer.');
   } else if (YES_RE.test(t)) {
     hints.push(
-      "Si ta dernière réponse contenait une question ou une proposition, le client l'ACCEPTE : avance à l'étape suivante (demande seulement l'information qui manque encore pour la réservation). Sinon, c'est un simple accusé de réception.",
+      "Si ta dernière réponse contenait une question ou une proposition, le client l'ACCEPTE : avance à l'étape suivante (demande seulement l'information qui manque encore pour la réservation). Si ta dernière question offrait un CHOIX entre plusieurs options (« ou »), un simple « oui » ne choisit rien : demande-lui laquelle il prend, en nommant clairement les options. Sinon, c'est un simple accusé de réception.",
     );
   }
   return hints.join('\n\n');
@@ -544,33 +545,45 @@ async function tripsWithContext(depart: string | undefined, arrivee: string | un
 }
 
 /**
- * Voyages lus dans Neon pour les ports cités récemment par le client.
- * Injectés dans le prompt : le modèle répond avec des données réelles, pas de mémoire.
+ * Reconstitue le trajet en cours en relisant les messages du client, du plus ancien au plus récent.
+ * Un message qui cite deux ports fixe départ ET arrivée ; un message qui n'en cite qu'un
+ * (« oui toliara ») remplace le départ et garde l'arrivée déjà connue.
  */
-async function tripsContext(userMessages: string[], places: string[]): Promise<string> {
-  const current = userMessages[userMessages.length - 1] ?? '';
-  const portsIn = (text: string) => {
-    const t = norm(text);
-    return places
+function currentRoute(userMessages: string[], places: string[]): { depart?: string; arrivee?: string } {
+  let depart: string | undefined;
+  let arrivee: string | undefined;
+  for (const m of userMessages) {
+    const t = norm(m);
+    const found = places
       .map((p) => ({ p, i: t.indexOf(norm(p)) }))
       .filter((x) => x.i >= 0)
       .sort((x, y) => x.i - y.i)
       .map((x) => x.p);
-  };
-
-  // ports du message le plus récent qui en cite
-  let mentioned: string[] = [];
-  for (const m of [...userMessages].reverse()) {
-    mentioned = portsIn(m);
-    if (mentioned.length) break;
+    if (found.length >= 2) {
+      depart = found[0];
+      arrivee = found[1];
+    } else if (found.length === 1) {
+      depart = found[0];
+    }
   }
+  return { depart, arrivee };
+}
+
+/**
+ * Voyages lus dans Neon pour le trajet en cours de la conversation.
+ * Injectés dans le prompt : le modèle répond avec des données réelles, pas de mémoire.
+ */
+async function tripsContext(userMessages: string[], places: string[]): Promise<string> {
+  const current = userMessages[userMessages.length - 1] ?? '';
+  const route = currentRoute(userMessages, places);
 
   const asked =
-    mentioned.length > 0 || /(voyage|trajet|depart|prochain|date|prix|tarif|ligne|que peux|que faire|alors)/.test(norm(current));
+    Boolean(route.depart || route.arrivee) ||
+    /(voyage|trajet|depart|prochain|date|prix|tarif|ligne|que peux|que faire|alors)/.test(norm(current));
   if (!asked) return '';
 
   try {
-    const data = await tripsWithContext(mentioned[0], mentioned[1], 5);
+    const data = await tripsWithContext(route.depart, route.arrivee, 5);
     return JSON.stringify(data).slice(0, 3500);
   } catch (e) {
     console.error('[agent] lecture voyages :', safeError(e));
@@ -822,16 +835,27 @@ async function getFirstName(userId: string | null): Promise<string | null> {
 type ChatTools = Parameters<typeof chat>[1];
 
 /**
- * Un appel au modèle. llm.ts réessaie déjà les erreurs 429 et 5xx ;
- * on réessaie ici une fois les coupures réseau et les délais dépassés.
+ * Un appel au modèle. llm.ts réessaie déjà certaines erreurs ; on réessaie ici une fois :
+ * - les coupures réseau et les délais dépassés (attente de 1,5 s) ;
+ * - les erreurs 429 de Groq (limite de tokens par minute) : on attend le délai indiqué par Groq.
  */
 async function chatWithRetry(turn: Msg[], defs: ChatTools, opts: ChatOptions) {
   try {
     return await chat(turn, defs, opts);
   } catch (e) {
-    if (!/timeout|timed out|abort|fetch failed|ECONN|socket/i.test(safeError(e))) throw e;
-    console.warn(`[agent] LLM : nouvelle tentative après « ${safeError(e)} »`);
-    await sleep(1500);
+    const msg = safeError(e);
+    const isTimeout = /timeout|timed out|abort|fetch failed|ECONN|socket/i.test(msg);
+    const is429 = /429|rate limit/i.test(msg);
+    if (!isTimeout && !is429) throw e;
+
+    let wait = 1500;
+    if (is429) {
+      const m = msg.match(/try again in ([\d.]+)s/i);
+      wait = m ? Math.ceil(Number(m[1]) * 1000) + 500 : 8000;
+      if (wait > 20000) throw e; // attente trop longue : le secours répondra
+    }
+    console.warn(`[agent] LLM : nouvelle tentative dans ${wait} ms (${msg.slice(0, 80)})`);
+    await sleep(wait);
     return chat(turn, defs, opts);
   }
 }
@@ -892,8 +916,8 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
     return { conversationId: conv.id, reply: direct, pending: publicPending(conv.pending) };
   }
 
-  // Voyages lus directement dans Neon (ports cités récemment) : le modèle répond avec ces données, jamais de mémoire
-  const userTexts = conv.messages.filter((m) => m.role === 'user').slice(-4).map((m) => String(m.content ?? ''));
+  // Voyages lus directement dans Neon (trajet en cours de la conversation) : jamais de mémoire du modèle
+  const userTexts = conv.messages.filter((m) => m.role === 'user').slice(-12).map((m) => String(m.content ?? ''));
   const tripsData = await tripsContext(userTexts, places);
 
   // Preuves : tout ce que la réponse a le droit de citer (base lue, résultats d'outils, conversation)
@@ -928,7 +952,7 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
         // Réponse vide (le raisonnement a consommé tous les tokens) : une nouvelle tentative avec plus de marge
         if (!text && !emptyRetried) {
           emptyRetried = true;
-          opts = { ...opts, maxTokens: (opts.maxTokens ?? 500) * 2 };
+          opts = { ...opts, maxTokens: (opts.maxTokens ?? 350) * 2 };
           continue;
         }
         reply = text;
@@ -1020,7 +1044,9 @@ export async function runAgent(input: AgentInput, deps: AgentDeps): Promise<Agen
 
   reply = polish(reply);
 
-  conv.messages.push({ role: 'assistant', content: reply });
+  // Une réponse de secours (panne du modèle) ne doit pas entrer dans l'historique :
+  // elle fausserait le contexte et la consigne « ne répète pas ta dernière réponse » du tour suivant.
+  if (!degraded) conv.messages.push({ role: 'assistant', content: reply });
   await saveConv(conv);
 
   console.log(JSON.stringify({ ai: degraded ? 'secours' : 'ok', conv: conv.id, ms: Date.now() - t0, tools: used }));
