@@ -427,9 +427,9 @@ const reservationToolDefs = [
       parameters: {
         type: 'object',
         properties: {
-          depart: { type: 'string', description: 'port de départ (facultatif)' },
-          arrivee: { type: 'string', description: "port d'arrivée (facultatif)" },
-          limite: { type: 'integer', description: 'nombre maximal de voyages (5 par défaut)' },
+          depart: { type: ['string', 'null'], description: 'port de départ (facultatif)' },
+          arrivee: { type: ['string', 'null'], description: "port d'arrivée (facultatif)" },
+          limite: { type: ['integer', 'null'], description: 'nombre maximal de voyages (5 par défaut)' },
         },
       },
     },
@@ -446,8 +446,8 @@ const reservationToolDefs = [
           depart: { type: 'string' },
           arrivee: { type: 'string' },
           date: { type: 'string', description: 'AAAA-MM-JJ' },
-          quantite: { type: 'integer', description: 'nombre de colis / sacs / places' },
-          poids_total_kg: { type: 'number', description: 'poids TOTAL en kg' },
+          quantite: { type: ['integer', 'null'], description: 'nombre de colis / sacs / places' },
+          poids_total_kg: { type: ['number', 'null'], description: 'poids TOTAL en kg' },
         },
         required: ['depart', 'arrivee', 'date'],
       },
@@ -465,7 +465,7 @@ const reservationToolDefs = [
           marchandise: { type: 'string' },
           unite: { type: 'string', description: 'sac, colis, carton...' },
           quantite: { type: 'integer' },
-          poids_total_kg: { type: 'number', description: 'poids TOTAL en kg' },
+          poids_total_kg: { type: ['number', 'null'], description: 'poids TOTAL en kg' },
           depart: { type: 'string' },
           arrivee: { type: 'string' },
           date: { type: 'string', description: 'AAAA-MM-JJ' },
@@ -848,7 +848,8 @@ async function chatWithRetry(turn: Msg[], defs: ChatTools, opts: ChatOptions) {
       const msg = safeError(e);
       const isTimeout = /timeout|timed out|abort|fetch failed|ECONN|socket/i.test(msg);
       const is429 = /429|rate limit/i.test(msg);
-      if ((!isTimeout && !is429) || attempt >= MAX_TRIES) throw e;
+      const isBadToolCall = /tool call validation failed|tool_use_failed/i.test(msg);
+      if ((!isTimeout && !is429 && !isBadToolCall) || attempt >= MAX_TRIES) throw e;
 
       let wait = 1500;
       if (is429) {
