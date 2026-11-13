@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { pool } from '../db.js';
 import { formatReservationList } from '../utils/whatsappFormat.js';
 import { answerReservationQuestion } from '../utils/reservationQuestions.js';
+import { ADMIN_ONLY_TEXT, matchCommand, runCommand } from '../utils/adminCommands.js';
 
 export const whatsappWebhookRouter = Router();
 
@@ -20,11 +21,10 @@ const APP_CONFIRM_MESSAGE =
   'Pour confirmer et enregistrer cette réservation, connectez-vous à l’application Saint-Jude. ' +
   'Ici, je peux vérifier les voyages, les tarifs et préparer votre demande.';
 
-const ADMIN_ONLY_MESSAGE =
-  '🔒 Cette information est réservée aux administrateurs. ' +
-  'Votre numéro doit être enregistré dans votre profil Saint-Jude (champ téléphone) avec un rôle administrateur.';
-
-const LOOKUP_ERROR_MESSAGE = '⚠️ Je n’ai pas pu consulter les réservations pour le moment. Réessayez dans un instant.';
+// Jamais de chiffres inventés ni de données anciennes présentées comme actuelles
+const LOOKUP_ERROR_MESSAGE =
+  '⚠️ Impossible de récupérer les données SAINT-JUDE pour le moment. ' +
+  'Aucune information n’a été confirmée. Veuillez réessayer plus tard.';
 
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -236,16 +236,29 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     return;
   }
 
-  const n = normalize(text);
+  // Compte de l'expéditeur : cherché une seule fois par message, et seulement si nécessaire
+  let userLookup: Promise<KnownUser | null> | null = null;
+  const getUser = (): Promise<KnownUser | null> => {
+    if (!userLookup) {
+      userLookup = findUserByPhone(from).catch((err) => {
+        console.warn(`[WhatsApp] recherche du compte impossible : ${(err as Error).message}`);
+        return null;
+      });
+    }
+    return userLookup;
+  };
 
-  // « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
+  const n = normalize(text);
+  const masked = `***${from.slice(-3)}`;
+
+  // 1) « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
   if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
     let answers: string[] = [LOOKUP_ERROR_MESSAGE];
     try {
-      const user = await findUserByPhone(from);
+      const user = await getUser();
       const isAdmin = user?.isAdmin === true;
-      console.info(`[WhatsApp] réservations en attente demandées par ***${from.slice(-3)} : admin=${isAdmin ? 'oui' : 'non'}`);
-      answers = isAdmin ? await answerPendingReservations() : [ADMIN_ONLY_MESSAGE];
+      console.info(`[WhatsApp] réservations en attente demandées par ${masked} : admin=${isAdmin ? 'oui' : 'non'}`);
+      answers = isAdmin ? await answerPendingReservations() : [ADMIN_ONLY_TEXT];
     } catch (err) {
       console.warn(`[WhatsApp] consultation des réservations impossible : ${(err as Error).message}`);
     }
@@ -254,22 +267,36 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     return;
   }
 
-  // Questions sur les réservations (« qui a fait réservation aujourd'hui ? », « combien… ») :
+  // 2) Commandes : aide, résumé du jour/semaine/mois, bateaux, voyages
+  const command = matchCommand(text);
+  if (command) {
+    const user = await getUser();
+    console.info(
+      `[WhatsApp] commande ${command} de ${masked} : compte=${user ? 'oui' : 'non'} admin=${user?.isAdmin ? 'oui' : 'non'}`,
+    );
+    try {
+      const answers = await runCommand(command, text, { id: user?.id ?? null, isAdmin: user?.isAdmin === true });
+      for (const part of limitMessages(answers)) await sendText(from, part);
+    } catch (err) {
+      console.warn(`[WhatsApp] commande ${command} impossible : ${(err as Error).message}`);
+      await sendText(from, LOOKUP_ERROR_MESSAGE);
+    }
+    return;
+  }
+
+  // 3) Questions sur les réservations (« qui a fait réservation aujourd'hui ? », « combien… ») :
   // réponse lue dans Neon, sans jamais lancer une nouvelle réservation. Admin : tout ;
   // client : uniquement ses propres réservations. Les demandes de réservation passent plus bas.
   if (/reserv/.test(n)) {
-    const user = await findUserByPhone(from).catch((err) => {
-      console.warn(`[WhatsApp] recherche du compte impossible : ${(err as Error).message}`);
-      return null;
-    });
     try {
+      const user = await getUser();
       const answers = await answerReservationQuestion(text, {
         id: user?.id ?? null,
         isAdmin: user?.isAdmin === true,
       });
       if (answers) {
         console.info(
-          `[WhatsApp] question réservations de ***${from.slice(-3)} : compte=${user ? 'oui' : 'non'} admin=${user?.isAdmin ? 'oui' : 'non'}`,
+          `[WhatsApp] question réservations de ${masked} : compte=${user ? 'oui' : 'non'} admin=${user?.isAdmin ? 'oui' : 'non'}`,
         );
         for (const part of limitMessages(answers)) await sendText(from, part);
         return;
@@ -281,6 +308,7 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     }
   }
 
+  // 4) Conversation libre (IA) : comprendre la demande, préparer un devis
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   let reply = 'Désolé, une erreur est survenue. Réessayez dans un instant.';
   let nextDraft: Record<string, unknown> = state.draft;
