@@ -5,6 +5,7 @@ import { pool } from '../db.js';
 import { formatReservationList } from '../utils/whatsappFormat.js';
 import { answerReservationQuestion } from '../utils/reservationQuestions.js';
 import { ADMIN_ONLY_TEXT, matchCommand, runCommand } from '../utils/adminCommands.js';
+import { isAdmin as isConfiguredAdminPhone } from '../services/admin.js';
 
 export const whatsappWebhookRouter = Router();
 
@@ -28,6 +29,7 @@ const LOOKUP_ERROR_MESSAGE =
   'Aucune information n’a été confirmée. Veuillez réessayer plus tard.';
 
 const RESET_MESSAGE = 'D’accord, on repart de zéro. Que souhaitez-vous faire ? (voyages, tarifs, expédier une marchandise…)';
+const ADMIN_RESET_MESSAGE = 'D’accord, on repart de zéro. Que voulez-vous consulter ? (réservations, résumé du jour, voyages, bateaux…)';
 const REPEAT_HINT = '\n\n_Tapez *annuler* pour recommencer ou *aide* pour voir les commandes._';
 
 function safeEqual(a: string, b: string): boolean {
@@ -105,6 +107,8 @@ function allowByRate(from: string): boolean {
    Utilisateurs : identifiés par leur numéro WhatsApp (signé par Meta)
    Rôles administrateur : variable WHATSAPP_ADMIN_ROLES (séparés par des virgules),
    sinon admin, administrateur, proprietaire, owner. Accents et majuscules ignorés.
+   De plus, le numéro WhatsApp administrateur configuré dans la page Configuration
+   (table notification_settings) est toujours reconnu comme administrateur.
 ========================================================= */
 const ADMIN_ROLES = (process.env.WHATSAPP_ADMIN_ROLES ?? 'admin,administrateur,proprietaire,owner')
   .split(',')
@@ -112,7 +116,7 @@ const ADMIN_ROLES = (process.env.WHATSAPP_ADMIN_ROLES ?? 'admin,administrateur,p
   .filter(Boolean);
 
 interface KnownUser {
-  id: string;
+  id: string | null;
   name: string;
   isAdmin: boolean;
 }
@@ -141,6 +145,28 @@ async function findUserByPhone(from: string): Promise<KnownUser | null> {
     name: `${rows[0].name ?? ''} ${rows[0].lastName ?? ''}`.trim(),
     isAdmin: ADMIN_ROLES.includes(role),
   };
+}
+
+/**
+ * Compte de l'expéditeur + numéro administrateur configuré dans l'interface.
+ * Le toggle « Actif / Inactif » de la page Configuration ne concerne que l'envoi
+ * des notifications : il n'intervient pas dans la reconnaissance de l'admin.
+ */
+async function resolveSender(from: string): Promise<KnownUser | null> {
+  const user = await findUserByPhone(from).catch((err) => {
+    console.warn(`[WhatsApp] recherche du compte impossible : ${(err as Error).message}`);
+    return null;
+  });
+  if (user?.isAdmin) return user;
+
+  const configuredAdmin = await isConfiguredAdminPhone(from).catch((err) => {
+    console.warn(`[WhatsApp] numéro admin configuré illisible : ${(err as Error).message}`);
+    return false;
+  });
+  if (configuredAdmin) {
+    return { id: user?.id ?? null, name: user?.name || 'Administrateur', isAdmin: true };
+  }
+  return user;
 }
 
 /* =========================================================
@@ -246,10 +272,18 @@ async function processMessage(from: string, id: string, text: string): Promise<v
   const n = normalize(text);
   const masked = `***${from.slice(-3)}`;
 
+  // Compte de l'expéditeur : cherché une seule fois par message, et seulement si nécessaire
+  let userLookup: Promise<KnownUser | null> | null = null;
+  const getUser = (): Promise<KnownUser | null> => {
+    if (!userLookup) userLookup = resolveSender(from);
+    return userLookup;
+  };
+
   // Commande « annuler / recommencer » : efface le brouillon et l'historique
   if (isReset(n)) {
     conversations.delete(from);
-    await sendText(from, RESET_MESSAGE);
+    const user = await getUser();
+    await sendText(from, user?.isAdmin ? ADMIN_RESET_MESSAGE : RESET_MESSAGE);
     return;
   }
 
@@ -271,19 +305,7 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     return;
   }
 
-  // Compte de l'expéditeur : cherché une seule fois par message, et seulement si nécessaire
-  let userLookup: Promise<KnownUser | null> | null = null;
-  const getUser = (): Promise<KnownUser | null> => {
-    if (!userLookup) {
-      userLookup = findUserByPhone(from).catch((err) => {
-        console.warn(`[WhatsApp] recherche du compte impossible : ${(err as Error).message}`);
-        return null;
-      });
-    }
-    return userLookup;
-  };
-
-  // 1) « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
+  // 1) « Réservations en attente » : réservé aux administrateurs
   if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
     let answers: string[] = [LOOKUP_ERROR_MESSAGE];
     try {
@@ -340,7 +362,12 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     }
   }
 
-  // 4) Conversation libre (IA) : comprendre la demande, préparer un devis
+  // 4) Conversation libre (IA) : comprendre la demande, préparer un devis (client)
+  //    ou répondre à l'administrateur comme à un collègue
+  const sender = await getUser();
+  const userRole: 'admin' | 'client' = sender?.isAdmin ? 'admin' : 'client';
+  console.info(`[WhatsApp] conversation libre de ${masked} : rôle=${userRole}`);
+
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   let reply = 'Désolé, une erreur est survenue. Réessayez dans un instant.';
   let nextDraft: Record<string, unknown> = state.draft;
@@ -357,7 +384,11 @@ async function processMessage(from: string, id: string, text: string): Promise<v
       },
       body: JSON.stringify({
         question: text,
-        context: { currentContext: state.draft },
+        context: {
+          currentContext: state.draft,
+          userRole, // 'admin' : ne pas proposer de réservation de transport, répondre à l'administrateur
+          userName: sender?.name || undefined,
+        },
         history: state.history, // l'IA voit ses propres réponses précédentes
       }),
       signal: AbortSignal.timeout(40_000),
@@ -368,7 +399,7 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     } else if (r.ok) {
       const data = (await r.json()) as { reply?: string; updatedContext?: Record<string, any> };
       const ctx = data.updatedContext ?? {};
-      quoted = ctx.awaitingConfirm === true;
+      quoted = userRole === 'client' && ctx.awaitingConfirm === true;
       // Pas de réservation depuis WhatsApp : on remplace la question de confirmation
       reply = (data.reply ?? reply).replace(
         /Souhaitez-vous confirmer cette réservation\s*\?/g,
