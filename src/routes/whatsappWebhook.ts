@@ -13,6 +13,7 @@ const CONTEXT_TTL_MS = 30 * 60_000;
 const SEEN_TTL_MS = 10 * 60_000;
 const RATE_LIMIT_PER_MIN = 12;
 const MAX_MESSAGES = 6; // 6 messages de 5 cartes au maximum par réponse
+const MAX_TURNS = 8; // nombre de messages d'historique transmis à l'IA
 
 // Secret généré à chaque démarrage : sert uniquement à l'appel interne vers /chat
 const INTERNAL_SECRET = crypto.randomBytes(24).toString('hex');
@@ -25,6 +26,9 @@ const APP_CONFIRM_MESSAGE =
 const LOOKUP_ERROR_MESSAGE =
   '⚠️ Impossible de récupérer les données SAINT-JUDE pour le moment. ' +
   'Aucune information n’a été confirmée. Veuillez réessayer plus tard.';
+
+const RESET_MESSAGE = 'D’accord, on repart de zéro. Que souhaitez-vous faire ? (voyages, tarifs, expédier une marchandise…)';
+const REPEAT_HINT = '\n\n_Tapez *annuler* pour recommencer ou *aide* pour voir les commandes._';
 
 function safeEqual(a: string, b: string): boolean {
   const x = Buffer.from(a);
@@ -51,9 +55,15 @@ export function internalChatOnly(req: Request, res: Response, next: NextFunction
 /* =========================================================
    Mémoire de conversation par numéro (perdue au redémarrage du serveur)
 ========================================================= */
+interface ChatTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 interface ConversationState {
   draft: Record<string, unknown>;
   quoted: boolean; // le dernier message proposait de confirmer la réservation
+  history: ChatTurn[]; // derniers échanges, transmis à l'IA pour rester cohérent
   at: number;
 }
 const conversations = new Map<string, ConversationState>();
@@ -71,6 +81,13 @@ const normalize = (s: string) =>
   s.normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/’/g, "'").toLowerCase().trim();
 
 const isYes = (s: string) => /^(oui|ok|d'accord|confirme|confirmer|valide|valider|eny)\b/.test(normalize(s));
+
+/** Commandes de remise à zéro de la conversation. */
+const isReset = (n: string) => /^(annuler|recommencer|reset|nouvelle demande|repartir de zero)$/.test(n);
+
+function pushTurn(history: ChatTurn[], role: ChatTurn['role'], content: string): ChatTurn[] {
+  return [...history, { role, content: content.slice(0, 600) }].slice(-MAX_TURNS);
+}
 
 function allowByRate(from: string): boolean {
   const now = Date.now();
@@ -226,13 +243,31 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     return;
   }
 
+  const n = normalize(text);
+  const masked = `***${from.slice(-3)}`;
+
+  // Commande « annuler / recommencer » : efface le brouillon et l'historique
+  if (isReset(n)) {
+    conversations.delete(from);
+    await sendText(from, RESET_MESSAGE);
+    return;
+  }
+
   const prev = conversations.get(from);
   const state: ConversationState =
-    prev && Date.now() - prev.at < CONTEXT_TTL_MS ? prev : { draft: {}, quoted: false, at: Date.now() };
+    prev && Date.now() - prev.at < CONTEXT_TTL_MS
+      ? prev
+      : { draft: {}, quoted: false, history: [], at: Date.now() };
 
   // Le client dit « oui » après le devis : la confirmation se fait dans l'application
   if (state.quoted && isYes(text)) {
     await sendText(from, APP_CONFIRM_MESSAGE);
+    conversations.set(from, {
+      ...state,
+      quoted: false,
+      history: pushTurn(pushTurn(state.history, 'user', text), 'assistant', APP_CONFIRM_MESSAGE),
+      at: Date.now(),
+    });
     return;
   }
 
@@ -247,9 +282,6 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     }
     return userLookup;
   };
-
-  const n = normalize(text);
-  const masked = `***${from.slice(-3)}`;
 
   // 1) « Réservations en attente » : réservé aux administrateurs identifiés par leur numéro
   if (/reservation/.test(n) && /(attente|pending|a valider)/.test(n)) {
@@ -313,6 +345,7 @@ async function processMessage(from: string, id: string, text: string): Promise<v
   let reply = 'Désolé, une erreur est survenue. Réessayez dans un instant.';
   let nextDraft: Record<string, unknown> = state.draft;
   let quoted = false;
+  let aiOk = false;
 
   try {
     const r = await fetch(`http://127.0.0.1:${port}/internal/whatsapp-ai/chat`, {
@@ -322,7 +355,11 @@ async function processMessage(from: string, id: string, text: string): Promise<v
         'x-internal-secret': INTERNAL_SECRET,
         'x-forwarded-for': from, // limite de débit par numéro de téléphone
       },
-      body: JSON.stringify({ question: text, context: { currentContext: state.draft } }),
+      body: JSON.stringify({
+        question: text,
+        context: { currentContext: state.draft },
+        history: state.history, // l'IA voit ses propres réponses précédentes
+      }),
       signal: AbortSignal.timeout(40_000),
     });
 
@@ -338,6 +375,7 @@ async function processMessage(from: string, id: string, text: string): Promise<v
         'Pour la confirmer, connectez-vous à l’application Saint-Jude.',
       );
       nextDraft = { ...ctx, awaitingConfirm: false };
+      aiOk = true;
     } else {
       console.warn(`[WhatsApp] /chat a répondu ${r.status}`);
     }
@@ -345,7 +383,20 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     console.warn(`[WhatsApp] appel /chat impossible : ${(err as Error).message}`);
   }
 
-  conversations.set(from, { draft: nextDraft, quoted, at: Date.now() });
+  // Évite de répéter mot pour mot la dernière réponse : propose une issue à l'utilisateur
+  const lastAssistant = [...state.history].reverse().find((t) => t.role === 'assistant');
+  if (aiOk && lastAssistant && normalize(lastAssistant.content) === normalize(reply)) {
+    reply += REPEAT_HINT;
+  }
+
+  // L'historique n'est enregistré que si l'IA a réellement répondu (pas les messages d'erreur)
+  let history = state.history;
+  if (aiOk) {
+    history = pushTurn(history, 'user', text);
+    history = pushTurn(history, 'assistant', reply);
+  }
+
+  conversations.set(from, { draft: nextDraft, quoted, history, at: Date.now() });
   await sendText(from, reply);
 }
 

@@ -15,7 +15,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-11-06-boat-usable';
+const BUILD = 'ai-2026-11-24-natural-chat';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -458,6 +458,26 @@ async function getKnownPlaces(): Promise<string[]> {
 }
 
 /* =========================================================
+   Historique de conversation (envoyé par le webhook WhatsApp)
+   Il vient d'un appel interne mais est quand même revalidé : rôles connus,
+   textes courts, 6 derniers messages au maximum.
+========================================================= */
+const HISTORY_MAX = 6;
+
+function sanitizeHistory(raw: unknown): ChatMessage[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChatMessage[] = [];
+  for (const item of raw.slice(-HISTORY_MAX)) {
+    const role = (item as any)?.role;
+    const content = (item as any)?.content;
+    if ((role === 'user' || role === 'assistant') && typeof content === 'string' && content.trim()) {
+      out.push({ role, content: content.trim().slice(0, 500) });
+    }
+  }
+  return out;
+}
+
+/* =========================================================
    Extraction déterministe (fallback et compléments)
 ========================================================= */
 const NUM_WORDS: Record<string, number> = {
@@ -607,9 +627,19 @@ const isSmallTalk = (t: string) =>
     strip(t),
   );
 
+/** Remarque ou reproche (« vous êtes fou », « c'est nul »…) : ce n'est pas une réponse à la question. */
+const isRemark = (qn: string) =>
+  /\b(fou|folle|idiot|idiote|stupide|nul|nulle|imbecile|debile|ridicule|menteur|arnaque|n'importe quoi)\b/.test(qn);
+
+/** Retire « D’accord ! » / « Très bien, » en tête d'une question de nextQuestion(). */
+const questionOnly = (t: string) => {
+  const s = t.replace(/^(?:D[’']accord[^!.]*[!.]|Très bien[^!.]*[!.])\s*/i, '').trim();
+  return s ? s.charAt(0).toUpperCase() + s.slice(1) : t;
+};
+
 const looksLikeQuestion = (t: string) =>
   /\?\s*$/.test(t) ||
-  /^(combien|quel|quels|quelle|quelles|y a[- ]t[- ]il|est[- ]ce|ou |quand|comment|pourquoi|a quelle|c'est quoi|qu'est|peux[- ]tu|pouvez[- ]vous|donne|liste|affiche|montre|dis[- ]moi|et le|et la|et les)/.test(
+  /^(combien|quel|quels|quelle|quelles|y a[- ]t[- ]il|est[- ]ce|ou |quand|comment|pourquoi|a quelle|c'est quoi|qu'est|qui est|peux[- ]tu|pouvez[- ]vous|donne|liste|affiche|montre|dis[- ]moi|et le|et la|et les)/.test(
     strip(t).replace(/’/g, "'"),
   );
 
@@ -996,13 +1026,9 @@ export async function flushOutbox() {
   }
 }
 
-// Reprise des envois en échec (l'instance gratuite de Render se met en veille)
-if (notificationsEnabled()) {
-  setInterval(() => void flushOutbox(), 60_000).unref?.();
-}
-
-// Reprise des envois en échec (l'instance gratuite de Render se met en veille)
-if (n8nUrl()) {
+// Reprise des envois en échec (l'instance gratuite de Render se met en veille).
+// Un seul minuteur (l'ancienne version en créait deux quand n8n était configuré).
+if (notificationsEnabled() || n8nUrl()) {
   setInterval(() => void flushOutbox(), 60_000).unref?.();
 }
 
@@ -1200,13 +1226,26 @@ aiRouter.get('/status', aiRequestLimiter, async (_req: Request, res: Response) =
 
 // SYSTEM_PROMPT et GENERAL_PROMPT sont importés depuis src/ai/prompts.ts
 
+// Consignes ajoutées à GENERAL_PROMPT : cohérence avec l'historique et conversation naturelle
+const CHAT_COHERENCE_RULES = `
+COHÉRENCE : tu vois les derniers messages de la conversation. Réponds en lien avec eux, comme une vraie personne.
+- Si le client répond à ta dernière question, tiens-en compte.
+- Si le message est une remarque, une plainte ou une question hors sujet, réponds-y en une phrase simple et polie, sans inventer, puis propose ton aide pour le transport maritime.
+- Ne répète jamais mot pour mot ta dernière phrase.
+- Si le client te demande qui est quelqu'un ou ce qu'est une chose que tu ne connais pas, dis-le simplement.`;
+
 // Le modèle ne reçoit AUCUN nom de port : seul le système (la base) connaît les ports et trajets.
-async function answerGeneral(question: string, _places: string[]): Promise<string | null> {
+async function answerGeneral(
+  question: string,
+  _places: string[],
+  history: ChatMessage[] = [],
+): Promise<string | null> {
   try {
     const provider = getProvider();
     const out = await provider.chat(
       [
-        { role: 'system', content: GENERAL_PROMPT },
+        { role: 'system', content: `${GENERAL_PROMPT}\n${CHAT_COHERENCE_RULES}` },
+        ...history,
         { role: 'user', content: question },
       ],
       { temperature: 0.3, maxTokens: 300, json: false },
@@ -1520,6 +1559,9 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       /* contexte illisible → brouillon vide */
     }
 
+    // Derniers messages de la conversation (envoyés par le webhook WhatsApp ; vide pour le site web)
+    const history = sanitizeHistory(req.body?.history);
+
     // Plusieurs noms de clé acceptés ; tout est revalidé par sanitizeDraft
     let draft: Draft = sanitizeDraft(
       parsedContext.currentContext ?? parsedContext.updatedContext ?? parsedContext.draft,
@@ -1635,11 +1677,35 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
       }
     }
 
+    // ---- C2. Remarques et « oui / non » sans contexte : jamais prises pour une marchandise
+    if (isRemark(qn)) {
+      const q0 = nextQuestion(draft);
+      if (q0) draft.asked = q0.field;
+      return send(
+        `Désolé si ma réponse vous a agacé. Je peux vous aider à expédier une marchandise ou vérifier un voyage.${
+          q0 ? ' ' + questionOnly(q0.text) : ''
+        }`,
+      );
+    }
+
+    if (!hasDraftContent(draft) && !draft.awaitingConfirm && qn.split(/\s+/).length <= 2) {
+      if (/^(oui|ok|d'accord|eny)\b/.test(qn)) {
+        const q0 = nextQuestion(draft);
+        if (q0) draft.asked = q0.field;
+        return send(`Parfait ! ${q0 ? questionOnly(q0.text) : 'Que souhaitez-vous expédier ?'}`);
+      }
+      if (/^(non|no|nope|tsia)\b/.test(qn)) {
+        return send(
+          'Pas de souci. Dites-moi quand vous voulez expédier une marchandise, ou posez-moi une question sur les voyages.',
+        );
+      }
+    }
+
     // ---- D. Salutation / bavardage : réponse polie puis question en cours
     if (isPureGreeting(question) || isSmallTalk(question)) {
       const q0 = nextQuestion(draft);
       if (q0) draft.asked = q0.field;
-      const rest = q0 ? q0.text.replace(/^(D’accord|Très bien)[^!.]*[!.]\s*/, '') : '';
+      const rest = q0 ? questionOnly(q0.text) : '';
       const hello = isThanks(question)
         ? 'Avec plaisir !'
         : isSmallTalk(question)
@@ -1839,7 +1905,7 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
         );
       }
       const answer =
-        (await answerGeneral(question, places)) ??
+        (await answerGeneral(question, places, history)) ??
         'Je n’ai pas bien compris votre question. Je peux préparer une réservation, consulter les voyages, les tarifs ou les bateaux.';
       // déjà rédigée par le LLM : pas de seconde reformulation
       return send(withReminder(answer, draft), { skipHumanize: true });
@@ -1867,8 +1933,11 @@ aiRouter.post('/chat', aiRequestLimiter, async (req: Request, res: Response) => 
         (q.field === 'departure' || q.field === 'destination') && places.length
           ? ` Ports disponibles : ${[...places].sort((a, b) => a.localeCompare(b)).slice(0, 8).join(', ')}.`
           : '';
+      // Exemple concret pour la marchandise : évite de répéter la même phrase à l'identique
+      const example =
+        q.field === 'cargoType' ? ' Par exemple : 20 sacs de riz, des meubles ou un colis de vêtements.' : '';
       const body = misunderstood
-        ? `Je n’ai pas bien compris votre réponse. ${q.text.replace(/^(?:D’accord[^!]*!|Très bien\.)\s*/, '')}${portsHint}`
+        ? `Je n’ai pas bien compris votre réponse. ${questionOnly(q.text)}${example}${portsHint}`
         : `${prefix}${q.text}${portsHint}`;
       return send(body);
     }
