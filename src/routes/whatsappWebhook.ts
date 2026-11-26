@@ -6,6 +6,8 @@ import { formatReservationList } from '../utils/whatsappFormat.js';
 import { answerReservationQuestion } from '../utils/reservationQuestions.js';
 import { ADMIN_ONLY_TEXT, matchCommand, runCommand } from '../utils/adminCommands.js';
 import { isAdmin as isConfiguredAdminPhone } from '../services/admin.js';
+import { askNeon } from '../ai/neonAssistant.js';
+import { getProvider } from './ai.js';
 
 export const whatsappWebhookRouter = Router();
 
@@ -119,6 +121,7 @@ interface KnownUser {
   id: string | null;
   name: string;
   isAdmin: boolean;
+  role?: string;
 }
 
 /**
@@ -144,6 +147,7 @@ async function findUserByPhone(from: string): Promise<KnownUser | null> {
     id: String(rows[0].id),
     name: `${rows[0].name ?? ''} ${rows[0].lastName ?? ''}`.trim(),
     isAdmin: ADMIN_ROLES.includes(role),
+    role,
   };
 }
 
@@ -257,6 +261,14 @@ async function sendText(to: string, body: string): Promise<void> {
   }
 }
 
+/** Demande d'expédition ou de réservation : traitée par le parcours de devis (/chat). */
+const isBookingRequest = (n: string) =>
+  /\b(envoyer|expedier|transporter|reserver|je (veux|voudrais|souhaite) (envoyer|expedier|reserver|transporter)|handefa|hamandrika)\b/.test(n);
+
+/** Un devis est en cours : les réponses courtes (« 20 », « Toamasina ») lui appartiennent. */
+const hasBookingInProgress = (draft: Record<string, unknown>) =>
+  ['departure', 'destination', 'cargoType', 'quantity', 'weightKg', 'dateExact'].some((k) => Boolean(draft[k]));
+
 /* =========================================================
    Traitement d'un message reçu
 ========================================================= */
@@ -362,7 +374,26 @@ async function processMessage(from: string, id: string, text: string): Promise<v
     }
   }
 
-  // 4) Conversation libre (IA) : comprendre la demande, préparer un devis (client)
+  // 4) Questions libres : réponse naturelle à partir des données de Neon, selon les droits
+  const booking = isBookingRequest(n) || hasBookingInProgress(state.draft);
+  if (!booking) {
+    let answer = LOOKUP_ERROR_MESSAGE;
+    let answered = false;
+    try {
+      const user = await getUser();
+      console.info(`[WhatsApp] assistant pour ${masked} : compte=${user ? 'oui' : 'non'} admin=${user?.isAdmin ? 'oui' : 'non'}`);
+      answer = await askNeon(text, user, state.history, (messages, options) => getProvider().chat(messages, options));
+      answered = true;
+    } catch (err) {
+      console.warn(`[WhatsApp] assistant indisponible : ${(err as Error).message.slice(0, 200)}`);
+    }
+    const history = answered ? pushTurn(pushTurn(state.history, 'user', text), 'assistant', answer) : state.history;
+    conversations.set(from, { draft: state.draft, quoted: false, history, at: Date.now() });
+    await sendText(from, answer);
+    return;
+  }
+
+  // 5) Conversation libre (IA) : comprendre la demande, préparer un devis (client)
   //    ou répondre à l'administrateur comme à un collègue
   const sender = await getUser();
   const userRole: 'admin' | 'client' = sender?.isAdmin ? 'admin' : 'client';

@@ -1174,7 +1174,7 @@ function createLLMProvider(): LLMProvider {
 }
 
 let providerCache: LLMProvider | null = null;
-function getProvider(): LLMProvider {
+export function getProvider(): LLMProvider {
   if (!providerCache) providerCache = createLLMProvider();
   return providerCache;
 }
