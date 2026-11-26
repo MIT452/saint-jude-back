@@ -7,6 +7,7 @@ import { roleKey } from "../utils/accessPolicy.js";
 import { assertAuthSecret, clearSessionCookie, normalizePermissions, requireAuth, setSessionCookie } from "../utils/authSession.js";
 import { hashPassword, verifyPassword } from "../utils/password.js";
 import { normalizePhone } from "../services/notifications.js";
+import { verifyRoleCode, normalizeRole, ROLE_LABELS, getRequiredRoles } from "./roleCodes.js";
 
 interface UserRow {
   id: string;
@@ -51,19 +52,17 @@ export function normalizeRegistrationInput(body: unknown) {
 
 /* ---------- Rôle choisi à l'inscription ---------- */
 
-// Rôle technique -> libellé enregistré dans la colonne "role".
-// Chaque rôle de cette liste exige le code de la variable ROLE_CODE_<ROLE> (Render > Environment).
+// Les 5 rôles du formulaire (agent, gestionnaire, capitaine, admin, proprietaire) sont gérés
+// par les codes générés dans le Profil (table role_access_codes, voir roleCodes.ts).
+// Les anciens rôles ci-dessous restent protégés par une variable Render ROLE_CODE_<ROLE>.
 const SELF_SERVICE_ROLES: Record<string, string> = {
   manager: "Manager",
-  gestionnaire: "Gestionnaire",
   comptable: "Comptable",
   caissier: "Caissier",
-  capitaine: "Capitaine",
-  agent: "Agent",
 };
 
 // Rôles qui ne peuvent JAMAIS être obtenus depuis le formulaire d'inscription
-const FORBIDDEN_ROLE_KEYS = new Set(["admin", "administrateur", "owner", "proprietaire", "directeur", "director"]);
+const FORBIDDEN_ROLE_KEYS = new Set(["owner", "directeur", "director"]);
 
 const sameCode = (a: string, b: string) => {
   const x = Buffer.from(a);
@@ -137,11 +136,26 @@ const loginRetryAfter = (id: string, ip: string) =>
 
 /**
  * Le navigateur ne décide jamais seul de son rôle :
- *  - Admin / Propriétaire / Directeur : jamais depuis le formulaire ;
- *  - rôle d'employé : code d'accès propre au rôle (variable ROLE_CODE_<ROLE> sur Render) ;
+ *  - les 5 rôles du formulaire : code vérifié dans la base (Agent libre tant qu'aucun code Agent n'est actif) ;
+ *  - anciens rôles d'employé : variable ROLE_CODE_<ROLE> sur Render ;
  *  - rôle absent ou inconnu : compte « Client » sans droits sur les modules.
  */
-function resolveRegistrationRole(requested: unknown, roleCode: unknown): { role: string } | { error: string; codeFailure: boolean } {
+async function resolveRegistrationRole(
+  requested: unknown,
+  roleCode: unknown,
+  ip: string,
+): Promise<{ role: string } | { error: string; codeFailure: boolean }> {
+  const given = typeof roleCode === "string" ? roleCode.trim() : "";
+
+  const dbRole = normalizeRole(requested);
+  if (dbRole) {
+    const check = await verifyRoleCode(dbRole, given, ip);
+    if (!check.ok) {
+      return { error: check.error ?? "Code d'accès invalide ou expiré pour ce rôle.", codeFailure: true };
+    }
+    return { role: ROLE_LABELS[dbRole] };
+  }
+
   const key = roleKey(requested);
   if (FORBIDDEN_ROLE_KEYS.has(key)) {
     return { error: "Ce rôle ne peut pas être choisi à l'inscription.", codeFailure: false };
@@ -151,8 +165,6 @@ function resolveRegistrationRole(requested: unknown, roleCode: unknown): { role:
 
   const variable = `ROLE_CODE_${key.toUpperCase()}`;
   const expected = process.env[variable]?.trim();
-  const given = typeof roleCode === "string" ? roleCode.trim() : "";
-
   if (!expected || isWeakCode(expected)) {
     // Visible uniquement dans les logs Render : le code du rôle n'est pas configuré correctement
     console.warn(`[register] ${variable} est absent ou trop faible : inscription refusée pour ce rôle.`);
@@ -164,6 +176,16 @@ function resolveRegistrationRole(requested: unknown, roleCode: unknown): { role:
   }
   return { role: label };
 }
+
+// Public : le formulaire d'inscription sait quels rôles demandent un code
+router.get("/required-roles", async (_request, response) => {
+  try {
+    response.json({ roles: await getRequiredRoles() });
+  } catch (error) {
+    console.error("Erreur required-roles", error);
+    response.status(503).json({ error: "Indisponible." });
+  }
+});
 
 router.post("/register", async (request, response) => {
   const { name, lastName, email, tel, password } = normalizeRegistrationInput(request.body);
@@ -189,12 +211,12 @@ router.post("/register", async (request, response) => {
   const ip = request.ip ?? "unknown";
 
   // Trop d'essais ratés de code de rôle : on bloque temporairement (les inscriptions « Client » restent possibles)
-  if (SELF_SERVICE_ROLES[roleKey(rawBody.role)] && isBlocked(email, ip)) {
+  if ((normalizeRole(rawBody.role) || SELF_SERVICE_ROLES[roleKey(rawBody.role)]) && isBlocked(email, ip)) {
     response.status(429).json({ error: "Trop de tentatives. Réessayez dans quelques minutes." });
     return;
   }
 
-  const resolved = resolveRegistrationRole(rawBody.role, rawBody.roleCode);
+  const resolved = await resolveRegistrationRole(rawBody.role, rawBody.roleCode, ip);
   if ("error" in resolved) {
     if (resolved.codeFailure) {
       registerFailure(`email:${email}`);

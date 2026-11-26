@@ -57,10 +57,12 @@ const ensureTable = (): Promise<void> => {
           code_hash   TEXT NOT NULL,
           expires_at  TIMESTAMPTZ,
           is_active   BOOLEAN NOT NULL DEFAULT TRUE,
-          created_by  INTEGER,
+          created_by  TEXT,
           created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
+      // Les identifiants utilisateur sont des UUID : created_by doit être du texte
+      await pool.query(`ALTER TABLE role_access_codes ALTER COLUMN created_by TYPE TEXT USING created_by::text`);
       await pool.query(`
         CREATE UNIQUE INDEX IF NOT EXISTS role_access_codes_one_active
           ON role_access_codes (role) WHERE is_active
@@ -112,7 +114,9 @@ const registerCodeFailure = (key: string) => {
 };
 
 /* ------------------------------------------------------------------ */
-/* Vérification (à appeler depuis /auth/register)                      */
+/* Vérification (appelée depuis /auth/register)                        */
+/*  - Gestionnaire / Capitaine / Admin / Propriétaire : code obligatoire */
+/*  - Agent : libre tant qu'aucun code Agent n'est actif                */
 /* ------------------------------------------------------------------ */
 export interface VerifyResult {
   ok: boolean;
@@ -155,6 +159,16 @@ export const verifyRoleCode = async (role: RegisterRole, code: string, clientKey
     return { ok: false, error: "Code d'accès invalide ou expiré pour ce rôle." };
   }
   return { ok: true };
+};
+
+// Rôles qui exigent un code à l'inscription (l'Agent seulement si un code Agent est actif)
+export const getRequiredRoles = async (): Promise<CodeRole[]> => {
+  await ensureTable();
+  const { rows } = await pool.query(
+    `SELECT role, expires_at FROM role_access_codes WHERE is_active = TRUE`,
+  );
+  const active = new Set(rows.map((r) => String(r.role)));
+  return CODE_ROLES.filter((r) => r !== "agent" || active.has("agent"));
 };
 
 /* ------------------------------------------------------------------ */
@@ -212,12 +226,15 @@ router.post("/", async (req, res) => {
   if (!role) return res.status(400).json({ error: "Rôle invalide." });
   if (![7, 30, 90].includes(days)) return res.status(400).json({ error: "Durée invalide (7, 30 ou 90 jours)." });
 
+  // Utilisateur connecté : requireAuth le place dans res.locals.sessionUser (id = UUID)
+  const sessionUser = res.locals.sessionUser as { id?: string | number } | undefined;
+  const createdBy = sessionUser?.id != null ? String(sessionUser.id) : null;
+
   const client = await pool.connect();
   try {
     await ensureTable();
     const code = generateCode(role);
     const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
-    const createdBy = Number((req as any).user?.id) || null;
 
     await client.query("BEGIN");
     await client.query(`UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`, [role]);
