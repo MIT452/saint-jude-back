@@ -23,18 +23,21 @@ import { traceRequest } from './ai/observability.js';
 import authRouter from './routes/auth.js';
 import roleCodesRouter from './routes/roleCodes.js'; // AJOUT CODES RÔLES 1/2
 import notificationSettingsRouter from './routes/notificationSettings.js';
-import { requireAuth, requireOwner, requireRole, requireTrustedOrigin } from './utils/authSession.js'; // MODIF : requireRole
-import { userGuard } from './utils/userGuard.js'; // MODIF : garde-fou utilisateurs
+import { requireAuth, requireRole, requireTrustedOrigin } from './utils/authSession.js';
 import { pool } from './db.js';
 import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
 import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // AJOUT AIOPS 1/3
 import { audit } from './audit/auditMiddleware.js'; // AJOUT AUDIT 1/3
 import auditRouter from './routes/audit.js'; // AJOUT AUDIT 2/3
 import { access } from './utils/accessPolicy.js'; // AJOUT DROITS
+import { userGuard } from './utils/userGuard.js'; // AJOUT PROTECTION DES COMPTES 1/2
 import accessRouter from './routes/access.js'; // AJOUT DROITS : /api/access/me
 import boatsAvailableRouter from './routes/boatsAvailable.js'; // AJOUT BATEAUX LECTURE SEULE
 import { whatsappWebhookRouter, saveRawBody, internalChatOnly } from './routes/whatsappWebhook.js'; // AJOUT WHATSAPP 1/4
 import { legalRouter } from './routes/legal.js'; // AJOUT LEGAL 1/2
+
+// Propriétaire et Administrateur ont les mêmes droits
+const requireTopRole = requireRole('Propriétaire', 'Administrateur', 'Admin');
 
 const app = express();
 
@@ -132,8 +135,7 @@ app.use(legalRouter); // AJOUT LEGAL 2/2
 app.use('/webhooks/whatsapp', whatsappWebhookRouter); // AJOUT WHATSAPP 3/4
 app.use('/internal/whatsapp-ai', internalChatOnly, aiRouter); // AJOUT WHATSAPP 4/4
 
-/* Codes d'accès des rôles (Propriétaire et Administrateur, protégé dans le routeur :
-   les codes Administrateur et Propriétaire restent réservés au Propriétaire).
+/* Codes d'accès des rôles (Propriétaire et Administrateur, protégé dans le routeur).
    Doit rester AVANT '/api/auth'. */
 app.use('/api/auth/role-codes', roleCodesRouter); // AJOUT CODES RÔLES 2/2
 
@@ -142,10 +144,10 @@ app.use('/api/notification-settings', requireAuth, notificationSettingsRouter);
 
 /* =========================
    JOURNAL D'AUDIT (lecture, vérification, revue des alertes)
-   Réservé au Propriétaire.
+   Réservé au Propriétaire et à l'Administrateur.
 ========================= */
 
-app.use('/api/audit', requireAuth, requireOwner, auditRouter); // AJOUT AUDIT 3/3
+app.use('/api/audit', requireAuth, requireTopRole, auditRouter); // AJOUT AUDIT 3/3
 
 /* =========================
    DROITS DU COMPTE CONNECTÉ
@@ -167,14 +169,12 @@ app.post('/api/reservations', requireAuth, checkCapacity); // AJOUT 2/2
    (variable ACCESS_MODE : report par défaut, enforce pour bloquer).
 ========================= */
 
-// MODIF : Propriétaire et Administrateur gèrent les utilisateurs ;
-// userGuard empêche l'Administrateur de créer, modifier ou supprimer un Propriétaire / Administrateur.
 app.use(
   '/api/user',
   requireAuth,
-  requireRole('Propriétaire', 'Administrateur', 'Admin'),
-  userGuard,
+  requireTopRole,
   audit('user'),
+  userGuard, // AJOUT PROTECTION DES COMPTES 2/2 : après audit, avant le CRUD
   createCrudRouter({
     table: 'user',
     jsonFields: ['permissions'],
