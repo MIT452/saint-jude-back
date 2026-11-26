@@ -144,31 +144,65 @@ function explainWhatsAppError(status: number, body: string): string {
   if (code === 132000 || code === 132001) {
     return `WhatsApp : modèle de message invalide (code ${code}). Vérifiez WHATSAPP_TEMPLATE et sa langue.`;
   }
+  if (code === 131047) {
+    return 'WhatsApp : plus de 24 h depuis le dernier message du destinataire (code 131047). Utilisez un modèle approuvé.';
+  }
+  if (code === 132018) {
+    return 'WhatsApp : paramètre de modèle refusé (code 132018). Vérifiez WHATSAPP_TEMPLATE_PARAMS.';
+  }
   return `WhatsApp ${status}${code ? ` (code ${code})` : ''} : ${msg.slice(0, 120)}`;
 }
 
-async function sendWhatsApp(to: string, p: Payload) {
-  // WhatsApp impose un template approuvé pour écrire en premier : hello_world pour les tests.
-  const template: Record<string, unknown> = {
-    name: env('WHATSAPP_TEMPLATE') || 'hello_world',
-    language: { code: env('WHATSAPP_TEMPLATE_LANG') || 'en_US' },
-  };
-  if (env('WHATSAPP_TEMPLATE_PARAMS') === '1') {
-    template.components = [
-      {
-        type: 'body',
-        parameters: [p.numero, `${p.depart ?? '-'} → ${p.arrivee ?? '-'}`, p.date].map((v) => ({
-          type: 'text',
-          text: String(v ?? '-'),
-        })),
-      },
-    ];
+/** Modèle Meta approuvé à utiliser ; « hello_world » (exemple anglais) est toujours ignoré. */
+const whatsappTemplate = () => {
+  const name = env('WHATSAPP_TEMPLATE');
+  return name === 'hello_world' ? '' : name;
+};
+
+/** Une variable de modèle refuse les retours à la ligne et les espaces multiples. */
+const toTemplateParam = (text: string) => {
+  const flat = text.replace(/\n+/g, ' · ').replace(/\s+/g, ' ').trim();
+  return flat.length > 900 ? `${flat.slice(0, 897)}...` : flat;
+};
+
+/**
+ * Sans modèle configuré : message texte naturel en français.
+ *   Meta ne le délivre que si le destinataire a écrit dans les dernières 24 h.
+ * Avec WHATSAPP_TEMPLATE : modèle approuvé, utilisable à tout moment.
+ *   WHATSAPP_TEMPLATE_PARAMS = message -> {{1}} reçoit le texte de la notification
+ *   WHATSAPP_TEMPLATE_PARAMS = 1       -> {{1}} numéro, {{2}} trajet, {{3}} date
+ */
+async function sendWhatsApp(to: string, m: Msg, p: Payload) {
+  const name = whatsappTemplate();
+  let content: Record<string, unknown>;
+
+  if (!name) {
+    content = { type: 'text', text: { preview_url: false, body: `*${m.subject}*\n\n${m.text}`.slice(0, 4096) } };
+  } else {
+    const mode = env('WHATSAPP_TEMPLATE_PARAMS');
+    const values: unknown[] =
+      mode === 'message'
+        ? [toTemplateParam(m.text)]
+        : mode === '1'
+          ? [p.numero, `${p.depart ?? '-'} → ${p.arrivee ?? '-'}`, p.date]
+          : [];
+    const template: Record<string, unknown> = {
+      name,
+      language: { code: env('WHATSAPP_TEMPLATE_LANG') || 'fr' },
+    };
+    if (values.length) {
+      template.components = [
+        { type: 'body', parameters: values.map((v) => ({ type: 'text', text: String(v ?? '-') })) },
+      ];
+    }
+    content = { type: 'template', template };
   }
+
   const version = env('WHATSAPP_API_VERSION') || 'v23.0';
   const res = await fetch(`https://graph.facebook.com/${version}/${env('WHATSAPP_PHONE_NUMBER_ID')}/messages`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${whatsappToken()}`, 'content-type': 'application/json' },
-    body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'template', template }),
+    body: JSON.stringify({ messaging_product: 'whatsapp', to, ...content }),
     signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) throw new Error(explainWhatsAppError(res.status, await res.text()));
@@ -191,7 +225,14 @@ export async function sendTestMessage(channel: 'email' | 'whatsapp', to: string,
   if (!whatsappEnabled()) throw new Error('WhatsApp non configuré sur le serveur (WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID)');
   const phone = normalizePhone(to);
   if (!phone) throw new Error('Numéro WhatsApp invalide');
-  await sendWhatsApp(phone, { numero: 'TEST', depart: '-', arrivee: '-', date: '-' });
+  await sendWhatsApp(
+    phone,
+    {
+      subject: 'Test de notification SAINT-JUDE',
+      text: 'Bonjour, ceci est un message de test : la configuration des notifications fonctionne.',
+    },
+    { numero: 'TEST', depart: '-', arrivee: '-', date: '-' },
+  );
 }
 
 /* =========================================================
@@ -288,7 +329,7 @@ export async function deliverNotification(event: string, p: Payload, already: st
         if (s.whatsapp_enabled && wa && whatsappEnabled()) {
           jobs.push({
             key: 'admin:whatsapp',
-            run: () => sendWhatsApp(wa, p),
+            run: () => sendWhatsApp(wa, m, p),
             log: { channel: 'whatsapp', to: wa },
           });
         }
@@ -298,7 +339,7 @@ export async function deliverNotification(event: string, p: Payload, already: st
       const adminMail = env('ADMIN_EMAIL');
       const adminWa = normalizePhone(env('ADMIN_WHATSAPP'));
       if (emailEnabled() && adminMail) jobs.push({ key: 'admin:email', run: () => sendEmail(adminMail, m) });
-      if (whatsappEnabled() && adminWa) jobs.push({ key: 'admin:whatsapp', run: () => sendWhatsApp(adminWa, p) });
+      if (whatsappEnabled() && adminWa) jobs.push({ key: 'admin:whatsapp', run: () => sendWhatsApp(adminWa, m, p) });
     }
   }
 
@@ -319,7 +360,7 @@ export async function deliverNotification(event: string, p: Payload, already: st
     if (waAllowed && whatsappEnabled() && clientWa) {
       jobs.push({
         key: 'client:whatsapp',
-        run: () => sendWhatsApp(clientWa, p),
+        run: () => sendWhatsApp(clientWa, m, p),
         log: { channel: 'whatsapp', to: clientWa },
       });
     }

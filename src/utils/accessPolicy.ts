@@ -11,8 +11,8 @@ export type RoleKey =
   | 'capitaine'
   | 'inconnu';
 
-/** Clé de la matrice : distingue Propriétaire, Administrateur et Agent. */
-export type PolicyRole = RoleKey | 'proprietaire' | 'agent';
+/** Clé de la matrice : distingue aussi les comptes Agent. */
+export type PolicyRole = RoleKey | 'agent';
 
 const norm = (value: unknown) =>
   String(value ?? '')
@@ -23,7 +23,7 @@ const norm = (value: unknown) =>
 
 const STAFF_ROLES: RoleKey[] = ['manager', 'gestionnaire', 'comptable', 'caissier', 'capitaine'];
 
-/** Rôle texte de la base -> clé technique (inchangé : utilisé par les autres fichiers). */
+/** Rôle texte de la base -> clé technique. Propriétaire et Administrateur = 'admin' (mêmes droits). */
 export const roleKey = (role: unknown): RoleKey => {
   const r = norm(role);
   if (['proprietaire', 'owner', 'admin', 'administrateur', 'directeur'].includes(r)) return 'admin';
@@ -32,12 +32,9 @@ export const roleKey = (role: unknown): RoleKey => {
   return 'inconnu';
 };
 
-/** Version fine : sépare Propriétaire / Administrateur / Agent. */
+/** Comme roleKey, mais reconnaît aussi les comptes Agent. */
 export const policyKey = (role: unknown): PolicyRole => {
-  const r = norm(role);
-  if (['proprietaire', 'owner', 'directeur'].includes(r)) return 'proprietaire';
-  if (['admin', 'administrateur'].includes(r)) return 'admin';
-  if (r === 'agent') return 'agent';
+  if (norm(role) === 'agent') return 'agent';
   return roleKey(role);
 };
 
@@ -49,8 +46,7 @@ const WITH_AGENT: PolicyRole[] = [...STAFF_ROLES, 'agent'];
 
 /**
  * MATRICE DES DROITS (miroir de PERMISSIONS dans le front, src/data/service.ts).
- * Le Propriétaire a toujours tous les droits.
- * L'Administrateur a tous les droits, sauf ceux de ADMIN_DENIED ci-dessous.
+ * Propriétaire et Administrateur ont toujours tous les droits.
  * Les réservations restent gérées par reservationAccessGuard.
  */
 export const POLICY: Record<string, ModulePolicy> = {
@@ -66,11 +62,6 @@ export const POLICY: Record<string, ModulePolicy> = {
   fuelconsumptions: { read: FUEL_ROLES, create: FUEL_ROLES, update: FUEL_ROLES, delete: [] },
 };
 
-/** Opérations interdites à l'Administrateur (le Propriétaire les garde). */
-const ADMIN_DENIED: Record<string, Operation[]> = {
-  cashmovements: ['create', 'update', 'delete'], // l'Admin consulte la caisse sans y écrire
-};
-
 const OPERATION_BY_METHOD: Record<string, Operation> = {
   POST: 'create',
   PUT: 'update',
@@ -80,8 +71,7 @@ const OPERATION_BY_METHOD: Record<string, Operation> = {
 
 export const isAllowed = (user: Pick<SessionUser, 'role'> | undefined, moduleName: string, op: Operation): boolean => {
   const key = policyKey(user?.role);
-  if (key === 'proprietaire') return true;
-  if (key === 'admin') return !(ADMIN_DENIED[moduleName] ?? []).includes(op);
+  if (key === 'admin') return true; // Propriétaire ou Administrateur : tout
   return (POLICY[moduleName]?.[op] ?? []).includes(key);
 };
 
