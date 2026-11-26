@@ -3,6 +3,7 @@ import { Router } from "express";
 import crypto from "crypto";
 import { pool } from "../db.js";
 import { requireAuth, requireOwner } from "../utils/authSession.js";
+import { sendMail } from "../utils/mailer.js";
 
 /* ------------------------------------------------------------------ */
 /* Rôles                                                               */
@@ -12,8 +13,6 @@ export type CodeRole = RegisterRole;
 
 export const CODE_ROLES: CodeRole[] = ["agent", "gestionnaire", "capitaine", "admin", "proprietaire"];
 
-/* Libellé enregistré dans la colonne "role" de la table "user".
-   ⚠️ Vérifie ces valeurs avec celles déjà présentes en base (Agent, Propriétaire, Capitaine…). */
 export const ROLE_LABELS: Record<RegisterRole, string> = {
   agent: "Agent",
   gestionnaire: "Gestionnaire",
@@ -114,10 +113,6 @@ const registerCodeFailure = (key: string) => {
 
 /* ------------------------------------------------------------------ */
 /* Vérification (à appeler depuis /auth/register)                      */
-/*  - Gestionnaire / Capitaine / Admin / Propriétaire : code obligatoire */
-/*  - Agent : libre tant qu'aucun code Agent n'est actif ; sinon        */
-/*    le code actif est exigé (même expiré : le Propriétaire doit le    */
-/*    renouveler ou le désactiver).                                      */
 /* ------------------------------------------------------------------ */
 export interface VerifyResult {
   ok: boolean;
@@ -163,6 +158,25 @@ export const verifyRoleCode = async (role: RegisterRole, code: string, clientKey
 };
 
 /* ------------------------------------------------------------------ */
+/* E-mail du code généré                                               */
+/* ------------------------------------------------------------------ */
+const sendCodeEmail = async (to: string, role: CodeRole, code: string, expiresAt: Date) => {
+  const label = ROLE_LABELS[role];
+  const dateFr = expiresAt.toLocaleDateString("fr-FR");
+  await sendMail(
+    to,
+    `Nouveau code d'accès — Rôle ${label}`,
+    `Un nouveau code d'accès pour le rôle ${label} vient d'être généré.\n\nCode : ${code}\nExpire le : ${dateFr}\n\nL'ancien code a été désactivé.\n\nÉquipe SAINT-JUDE`,
+    `<p>Bonjour,</p>
+     <p>Un nouveau code d'accès pour le rôle <b>${label}</b> vient d'être généré.</p>
+     <p style="font-size:22px;font-weight:bold;letter-spacing:2px">${code}</p>
+     <p>Date d'expiration : <b>${dateFr}</b></p>
+     <p>L'ancien code a été désactivé.</p>
+     <p>Cordialement,<br/>Équipe SAINT-JUDE</p>`,
+  );
+};
+
+/* ------------------------------------------------------------------ */
 /* Routes réservées au Propriétaire (protégées ici même)               */
 /* ------------------------------------------------------------------ */
 const router = Router();
@@ -191,7 +205,7 @@ router.get("/", async (_req, res) => {
   }
 });
 
-// Générer / renouveler un code (le code en clair n'est renvoyé qu'ici, une seule fois)
+// Générer / renouveler un code (renvoyé en clair une seule fois + envoyé par e-mail)
 router.post("/", async (req, res) => {
   const role = normalizeRole(req.body?.role);
   const days = Number(req.body?.days);
@@ -214,7 +228,22 @@ router.post("/", async (req, res) => {
     );
     await client.query("COMMIT");
 
-    res.status(201).json({ role, code, expiresAt: expiresAt.toISOString() });
+    // Envoi par e-mail au Propriétaire connecté (n'annule jamais la génération)
+    let emailSent = false;
+    if (createdBy) {
+      try {
+        const { rows } = await pool.query(`SELECT email FROM "user" WHERE id = $1`, [createdBy]);
+        const to = rows[0]?.email;
+        if (to) {
+          await sendCodeEmail(String(to), role, code, expiresAt);
+          emailSent = true;
+        }
+      } catch (mailErr) {
+        console.error("[role-codes] e-mail non envoyé", mailErr);
+      }
+    }
+
+    res.status(201).json({ role, code, expiresAt: expiresAt.toISOString(), emailSent });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => undefined);
     console.error("[role-codes] POST", err);

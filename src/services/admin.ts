@@ -1,4 +1,4 @@
-import { pool } from '../db';
+import { pool } from '../db.js';
 
 // 034 96 706 06 / +261 34 96 706 06 / 261339670606  ->  261339670606
 export function toE164MG(input: string): string | null {
