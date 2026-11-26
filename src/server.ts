@@ -23,7 +23,8 @@ import { traceRequest } from './ai/observability.js';
 import authRouter from './routes/auth.js';
 import roleCodesRouter from './routes/roleCodes.js'; // AJOUT CODES RÔLES 1/2
 import notificationSettingsRouter from './routes/notificationSettings.js';
-import { requireAuth, requireOwner, requireTrustedOrigin } from './utils/authSession.js';
+import { requireAuth, requireOwner, requireRole, requireTrustedOrigin } from './utils/authSession.js'; // MODIF : requireRole
+import { userGuard } from './utils/userGuard.js'; // MODIF : garde-fou utilisateurs
 import { pool } from './db.js';
 import { checkCapacity } from './utils/capacityGuard.js'; // AJOUT 1/2
 import { metricsMiddleware, metricsHandler } from './monitoring/metrics.js'; // AJOUT AIOPS 1/3
@@ -131,7 +132,8 @@ app.use(legalRouter); // AJOUT LEGAL 2/2
 app.use('/webhooks/whatsapp', whatsappWebhookRouter); // AJOUT WHATSAPP 3/4
 app.use('/internal/whatsapp-ai', internalChatOnly, aiRouter); // AJOUT WHATSAPP 4/4
 
-/* Codes d'accès des rôles (Propriétaire uniquement, protégé dans le routeur).
+/* Codes d'accès des rôles (Propriétaire et Administrateur, protégé dans le routeur :
+   les codes Administrateur et Propriétaire restent réservés au Propriétaire).
    Doit rester AVANT '/api/auth'. */
 app.use('/api/auth/role-codes', roleCodesRouter); // AJOUT CODES RÔLES 2/2
 
@@ -165,10 +167,13 @@ app.post('/api/reservations', requireAuth, checkCapacity); // AJOUT 2/2
    (variable ACCESS_MODE : report par défaut, enforce pour bloquer).
 ========================= */
 
+// MODIF : Propriétaire et Administrateur gèrent les utilisateurs ;
+// userGuard empêche l'Administrateur de créer, modifier ou supprimer un Propriétaire / Administrateur.
 app.use(
   '/api/user',
   requireAuth,
-  requireOwner,
+  requireRole('Propriétaire', 'Administrateur', 'Admin'),
+  userGuard,
   audit('user'),
   createCrudRouter({
     table: 'user',

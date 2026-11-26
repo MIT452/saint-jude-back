@@ -1,8 +1,9 @@
 // src/routes/roleCodes.ts
 import { Router } from "express";
+import type { RequestHandler, Response } from "express";
 import crypto from "crypto";
 import { pool } from "../db.js";
-import { requireAuth, requireOwner } from "../utils/authSession.js";
+import { requireAuth } from "../utils/authSession.js";
 import { sendMail } from "../utils/mailer.js";
 
 /* ------------------------------------------------------------------ */
@@ -42,6 +43,9 @@ export const normalizeRole = (value: unknown): RegisterRole | null => {
   if (v === "proprietaire") return "proprietaire";
   return null;
 };
+
+// Codes réservés au Propriétaire : Administrateur et Propriétaire
+const isTopRole = (role: CodeRole) => role === "admin" || role === "proprietaire";
 
 /* ------------------------------------------------------------------ */
 /* Table Neon (créée automatiquement si absente)                       */
@@ -115,8 +119,6 @@ const registerCodeFailure = (key: string) => {
 
 /* ------------------------------------------------------------------ */
 /* Vérification (appelée depuis /auth/register)                        */
-/*  - Gestionnaire / Capitaine / Admin / Propriétaire : code obligatoire */
-/*  - Agent : libre tant qu'aucun code Agent n'est actif                */
 /* ------------------------------------------------------------------ */
 export interface VerifyResult {
   ok: boolean;
@@ -191,10 +193,24 @@ const sendCodeEmail = async (to: string, role: CodeRole, code: string, expiresAt
 };
 
 /* ------------------------------------------------------------------ */
-/* Routes réservées au Propriétaire (protégées ici même)               */
+/* Routes : Propriétaire et Administrateur                             */
+/*  - codes Agent / Gestionnaire / Capitaine : les deux                 */
+/*  - codes Administrateur / Propriétaire : Propriétaire seulement      */
 /* ------------------------------------------------------------------ */
+const callerRole = (res: Response): RegisterRole | null =>
+  normalizeRole((res.locals.sessionUser as { role?: string } | undefined)?.role);
+
+const canManageCodes: RequestHandler = (_req, res, next) => {
+  const r = callerRole(res);
+  if (r === "proprietaire" || r === "admin") {
+    next();
+    return;
+  }
+  res.status(403).json({ error: "Accès réservé au Propriétaire ou à l'Administrateur." });
+};
+
 const router = Router();
-router.use(requireAuth, requireOwner);
+router.use(requireAuth, canManageCodes);
 
 // État des codes (jamais le code lui-même)
 router.get("/", async (_req, res) => {
@@ -205,13 +221,16 @@ router.get("/", async (_req, res) => {
          FROM role_access_codes
         WHERE is_active = TRUE`,
     );
+    const isOwnerCaller = callerRole(res) === "proprietaire";
     res.json(
-      rows.map((r) => ({
-        role: r.role,
-        isActive: r.is_active,
-        expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
-        createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
-      })),
+      rows
+        .filter((r) => isOwnerCaller || !isTopRole(r.role as CodeRole))
+        .map((r) => ({
+          role: r.role,
+          isActive: r.is_active,
+          expiresAt: r.expires_at ? new Date(r.expires_at).toISOString() : null,
+          createdAt: r.created_at ? new Date(r.created_at).toISOString() : null,
+        })),
     );
   } catch (err) {
     console.error("[role-codes] GET", err);
@@ -225,8 +244,10 @@ router.post("/", async (req, res) => {
   const days = Number(req.body?.days);
   if (!role) return res.status(400).json({ error: "Rôle invalide." });
   if (![7, 30, 90].includes(days)) return res.status(400).json({ error: "Durée invalide (7, 30 ou 90 jours)." });
+  if (isTopRole(role) && callerRole(res) !== "proprietaire") {
+    return res.status(403).json({ error: "Seul le Propriétaire peut gérer ce code." });
+  }
 
-  // Utilisateur connecté : requireAuth le place dans res.locals.sessionUser (id = UUID)
   const sessionUser = res.locals.sessionUser as { id?: string | number } | undefined;
   const createdBy = sessionUser?.id != null ? String(sessionUser.id) : null;
 
@@ -245,7 +266,7 @@ router.post("/", async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Envoi par e-mail au Propriétaire connecté (n'annule jamais la génération)
+    // Envoi par e-mail à la personne connectée (n'annule jamais la génération)
     let emailSent = false;
     if (createdBy) {
       try {
@@ -274,6 +295,9 @@ router.post("/", async (req, res) => {
 router.delete("/:role", async (req, res) => {
   const role = normalizeRole(req.params.role);
   if (!role) return res.status(400).json({ error: "Rôle invalide." });
+  if (isTopRole(role) && callerRole(res) !== "proprietaire") {
+    return res.status(403).json({ error: "Seul le Propriétaire peut gérer ce code." });
+  }
   try {
     await ensureTable();
     await pool.query(`UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`, [role]);
