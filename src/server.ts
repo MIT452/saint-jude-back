@@ -21,6 +21,7 @@ import advancedAiRouter from './routes/advanced-ai.js';
 import { initRealtime } from './realtime.js';
 import { traceRequest } from './ai/observability.js';
 import authRouter from './routes/auth.js';
+import roleCodesRouter from './routes/roleCodes.js'; // AJOUT CODES RÔLES 1/2
 import notificationSettingsRouter from './routes/notificationSettings.js';
 import { requireAuth, requireOwner, requireTrustedOrigin } from './utils/authSession.js';
 import { pool } from './db.js';
@@ -129,6 +130,10 @@ app.use(legalRouter); // AJOUT LEGAL 2/2
 
 app.use('/webhooks/whatsapp', whatsappWebhookRouter); // AJOUT WHATSAPP 3/4
 app.use('/internal/whatsapp-ai', internalChatOnly, aiRouter); // AJOUT WHATSAPP 4/4
+
+/* Codes d'accès des rôles (Propriétaire uniquement, protégé dans le routeur).
+   Doit rester AVANT '/api/auth'. */
+app.use('/api/auth/role-codes', roleCodesRouter); // AJOUT CODES RÔLES 2/2
 
 app.use('/api/auth', authRouter);
 app.use('/api/notification-settings', requireAuth, notificationSettingsRouter);
