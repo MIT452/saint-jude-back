@@ -15,7 +15,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-11-27-prix-saisi';
+const BUILD = 'ai-2026-11-27-prix-alias';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -332,6 +332,28 @@ const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
 const isRealIsoDate = (s: string) =>
   ISO_DATE.test(s) && buildIso(+s.slice(0, 4), +s.slice(5, 7), +s.slice(8, 10)) === s;
 
+/**
+ * [PRIX] Lit le prix au kilo saisi dans le formulaire.
+ * Plusieurs noms de champ sont acceptés ; à défaut, il est déduit du prix total / poids.
+ * Retourne {} si aucun prix n'est fourni (le tarif du voyage fait alors foi).
+ */
+function readPriceOverride(body: any, poidsTotalKg?: number): { value?: number } | { error: string } {
+  const keys = ['prixUnitaireKg', 'prixKg', 'prixParKg', 'prixAuKilo', 'pricePerKg', 'prix_kg', 'prixKilo'];
+  for (const k of keys) {
+    const raw = body?.[k];
+    if (raw === undefined || raw === null || raw === '') continue;
+    const p = Number(String(raw).replace(/\s/g, '').replace(',', '.'));
+    if (!Number.isFinite(p) || p < 0 || p > 100_000_000) return { error: `${k} invalide` };
+    if (p > 0) return { value: p };
+  }
+  const rawTotal = body?.prixTotal ?? body?.totalPrice ?? body?.prix_total;
+  if (rawTotal !== undefined && rawTotal !== null && rawTotal !== '' && poidsTotalKg && poidsTotalKg > 0) {
+    const t = Number(String(rawTotal).replace(/\s/g, '').replace(',', '.'));
+    if (Number.isFinite(t) && t > 0 && t <= 100_000_000_000) return { value: t / poidsTotalKg };
+  }
+  return {};
+}
+
 function readVerifyBody(body: any): { value: VerifyInput } | { error: string } {
   const depart = typeof body?.depart === 'string' ? body.depart.trim() : '';
   const arrivee = typeof body?.arrivee === 'string' ? body.arrivee.trim() : '';
@@ -362,7 +384,13 @@ function readVerifyBody(body: any): { value: VerifyInput } | { error: string } {
       return { error: 'quantite invalide' };
     }
   }
-  return { value: { depart, arrivee, date, poidsTotalKg, quantite, passagers } };
+
+  const price = readPriceOverride(body, poidsTotalKg);
+  if ('error' in price) return { error: price.error };
+
+  return {
+    value: { depart, arrivee, date, poidsTotalKg, quantite, passagers, prixKgOverride: price.value },
+  };
 }
 
 aiRouter.post('/verify', aiRequestLimiter, async (req: Request, res: Response) => {
@@ -1516,23 +1544,14 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
 }
 
 function readReserveBody(body: any): { value: ReserveInput } | { error: string } {
+  // [PRIX] readVerifyBody lit déjà le prix saisi (prixKgOverride) : on le réutilise ici
   const base = readVerifyBody(body);
   if ('error' in base) return base;
-  const { depart, arrivee, date, poidsTotalKg, quantite } = base.value;
+  const { depart, arrivee, date, poidsTotalKg, quantite, prixKgOverride } = base.value;
   if (!poidsTotalKg || !quantite) return { error: 'poidsTotalKg et quantite sont requis' };
 
   const text = (v: unknown, max: number) =>
     typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
-
-  // [PRIX] prix au kilo saisi (facultatif) : ignoré s'il est absent ou invalide
-  let prixUnitaireKg: number | undefined;
-  if (body?.prixUnitaireKg !== undefined && body?.prixUnitaireKg !== null && body?.prixUnitaireKg !== '') {
-    const p = Number(body.prixUnitaireKg);
-    if (!Number.isFinite(p) || p < 0 || p > 100_000_000) {
-      return { error: 'prixUnitaireKg invalide' };
-    }
-    if (p > 0) prixUnitaireKg = p;
-  }
 
   return {
     value: {
@@ -1544,7 +1563,7 @@ function readReserveBody(body: any): { value: ReserveInput } | { error: string }
       marchandise: text(body?.marchandise, 80),
       unite: text(body?.unite, 20),
       clientName: text(body?.clientName, 100),
-      prixUnitaireKg,
+      prixUnitaireKg: prixKgOverride,
     },
   };
 }
