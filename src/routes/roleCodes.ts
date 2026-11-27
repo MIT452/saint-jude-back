@@ -1,11 +1,12 @@
 // src/routes/roleCodes.ts
 import { Router } from "express";
 import crypto from "crypto";
+import type { PoolClient } from "pg";
 import { pool } from "../db.js";
 import { requireAuth, requireOwner } from "../utils/authSession.js";
 
 /* ------------------------------------------------------------------ */
-/* Rôles : Client (public) + 4 rôles du personnel (code d'accès)        */
+/* Rôles : Client (public) + 4 rôles du personnel (code d'accès)       */
 /* ------------------------------------------------------------------ */
 export type RegisterRole = "client" | "agent" | "gestionnaire" | "capitaine" | "proprietaire";
 export type CodeRole = Exclude<RegisterRole, "client">;
@@ -13,7 +14,7 @@ export type CodeRole = Exclude<RegisterRole, "client">;
 export const CODE_ROLES: CodeRole[] = ["agent", "gestionnaire", "capitaine", "proprietaire"];
 
 /* Libellé enregistré dans la colonne "role" de la table "user".
-   ⚠️ Vérifie avec les valeurs déjà présentes en base :
+   Vérifiez avec les valeurs déjà présentes en base :
    SELECT role, COUNT(*) FROM "user" GROUP BY role;  */
 export const ROLE_LABELS: Record<RegisterRole, string> = {
   client: "Client",
@@ -43,6 +44,10 @@ export const normalizeRole = (value: unknown): RegisterRole | null => {
   if (v === "proprietaire" || v === "admin" || v === "administrateur") return "proprietaire";
   return null;
 };
+
+/* Rôles pour lesquels le formulaire d'inscription doit demander un code.
+   Même règle que verifyRoleCode : tous les rôles sauf Client. */
+export const getRequiredRoles = async (): Promise<CodeRole[]> => [...CODE_ROLES];
 
 /* ------------------------------------------------------------------ */
 /* Table Neon (créée automatiquement si absente)                       */
@@ -91,7 +96,8 @@ const randomBlock = (len: number) => {
   for (let i = 0; i < len; i++) out += ALPHABET[bytes[i] % ALPHABET.length];
   return out;
 };
-const generateCode = (role: CodeRole) => `${PREFIX[role]}-${randomBlock(4)}-${randomBlock(4)}-${randomBlock(4)}`;
+const generateCode = (role: CodeRole) =>
+  `${PREFIX[role]}-${randomBlock(4)}-${randomBlock(4)}-${randomBlock(4)}`;
 
 /* ------------------------------------------------------------------ */
 /* Limitation des tentatives (en mémoire : 8 essais / 15 min / clé)    */
@@ -113,16 +119,20 @@ const registerCodeFailure = (key: string) => {
 };
 
 /* ------------------------------------------------------------------ */
-/* Vérification (à appeler depuis /auth/register)                      */
+/* Vérification (appelée depuis /auth/register)                        */
 /*  - Client : aucun code                                              */
-/*  - Agent / Gestionnaire / Capitaine / Propriétaire : code obligatoire */
+/*  - Agent / Gestionnaire / Capitaine / Propriétaire : code requis    */
 /* ------------------------------------------------------------------ */
 export interface VerifyResult {
   ok: boolean;
   error?: string;
 }
 
-export const verifyRoleCode = async (role: RegisterRole, code: string, clientKey: string): Promise<VerifyResult> => {
+export const verifyRoleCode = async (
+  role: RegisterRole,
+  code: string,
+  clientKey: string,
+): Promise<VerifyResult> => {
   if (role === "client") return { ok: true };
 
   const key = `rolecode:${clientKey}`;
@@ -194,17 +204,23 @@ router.post("/", async (req, res) => {
   const role = normalizeRole(req.body?.role);
   const days = Number(req.body?.days);
   if (!role || role === "client") return res.status(400).json({ error: "Rôle invalide." });
-  if (![7, 30, 90].includes(days)) return res.status(400).json({ error: "Durée invalide (7, 30 ou 90 jours)." });
+  if (![7, 30, 90].includes(days)) {
+    return res.status(400).json({ error: "Durée invalide (7, 30 ou 90 jours)." });
+  }
 
-  const client = await pool.connect();
+  let client: PoolClient | undefined;
   try {
     await ensureTable();
+    client = await pool.connect();
     const code = generateCode(role);
     const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
     const createdBy = Number((req as any).user?.id) || null;
 
     await client.query("BEGIN");
-    await client.query(`UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`, [role]);
+    await client.query(
+      `UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`,
+      [role],
+    );
     await client.query(
       `INSERT INTO role_access_codes (role, code_hash, expires_at, created_by)
        VALUES ($1, $2, $3, $4)`,
@@ -214,11 +230,11 @@ router.post("/", async (req, res) => {
 
     res.status(201).json({ role, code, expiresAt: expiresAt.toISOString() });
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => undefined);
+    await client?.query("ROLLBACK").catch(() => undefined);
     console.error("[role-codes] POST", err);
     res.status(500).json({ error: "Erreur serveur." });
   } finally {
-    client.release();
+    client?.release();
   }
 });
 
@@ -228,7 +244,10 @@ router.delete("/:role", async (req, res) => {
   if (!role || role === "client") return res.status(400).json({ error: "Rôle invalide." });
   try {
     await ensureTable();
-    await pool.query(`UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`, [role]);
+    await pool.query(
+      `UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`,
+      [role],
+    );
     res.status(204).end();
   } catch (err) {
     console.error("[role-codes] DELETE", err);
