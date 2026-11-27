@@ -1,24 +1,25 @@
 // src/routes/roleCodes.ts
 import { Router } from "express";
-import type { RequestHandler, Response } from "express";
 import crypto from "crypto";
 import { pool } from "../db.js";
-import { requireAuth } from "../utils/authSession.js";
-import { sendMail } from "../utils/mailer.js";
+import { requireAuth, requireOwner } from "../utils/authSession.js";
 
 /* ------------------------------------------------------------------ */
-/* Rôles                                                               */
+/* Rôles : Client (public) + 4 rôles du personnel (code d'accès)        */
 /* ------------------------------------------------------------------ */
-export type RegisterRole = "agent" | "gestionnaire" | "capitaine" | "admin" | "proprietaire";
-export type CodeRole = RegisterRole;
+export type RegisterRole = "client" | "agent" | "gestionnaire" | "capitaine" | "proprietaire";
+export type CodeRole = Exclude<RegisterRole, "client">;
 
-export const CODE_ROLES: CodeRole[] = ["agent", "gestionnaire", "capitaine", "admin", "proprietaire"];
+export const CODE_ROLES: CodeRole[] = ["agent", "gestionnaire", "capitaine", "proprietaire"];
 
+/* Libellé enregistré dans la colonne "role" de la table "user".
+   ⚠️ Vérifie avec les valeurs déjà présentes en base :
+   SELECT role, COUNT(*) FROM "user" GROUP BY role;  */
 export const ROLE_LABELS: Record<RegisterRole, string> = {
+  client: "Client",
   agent: "Agent",
   gestionnaire: "Gestionnaire",
   capitaine: "Capitaine",
-  admin: "Administrateur",
   proprietaire: "Propriétaire",
 };
 
@@ -26,7 +27,6 @@ const PREFIX: Record<CodeRole, string> = {
   agent: "AGT",
   gestionnaire: "GEST",
   capitaine: "CAP",
-  admin: "ADM",
   proprietaire: "OWN",
 };
 
@@ -36,11 +36,11 @@ export const normalizeRole = (value: unknown): RegisterRole | null => {
     .toLowerCase()
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "");
+  if (v === "client" || v === "voyageur") return "client";
   if (v === "agent") return "agent";
   if (v === "gestionnaire") return "gestionnaire";
   if (v === "capitaine") return "capitaine";
-  if (v === "admin" || v === "administrateur") return "admin";
-  if (v === "proprietaire") return "proprietaire";
+  if (v === "proprietaire" || v === "admin" || v === "administrateur") return "proprietaire";
   return null;
 };
 
@@ -58,12 +58,10 @@ const ensureTable = (): Promise<void> => {
           code_hash   TEXT NOT NULL,
           expires_at  TIMESTAMPTZ,
           is_active   BOOLEAN NOT NULL DEFAULT TRUE,
-          created_by  TEXT,
+          created_by  INTEGER,
           created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
       `);
-      // Les identifiants utilisateur sont des UUID : created_by doit être du texte
-      await pool.query(`ALTER TABLE role_access_codes ALTER COLUMN created_by TYPE TEXT USING created_by::text`);
       await pool.query(`
         CREATE UNIQUE INDEX IF NOT EXISTS role_access_codes_one_active
           ON role_access_codes (role) WHERE is_active
@@ -115,7 +113,9 @@ const registerCodeFailure = (key: string) => {
 };
 
 /* ------------------------------------------------------------------ */
-/* Vérification (appelée depuis /auth/register)                        */
+/* Vérification (à appeler depuis /auth/register)                      */
+/*  - Client : aucun code                                              */
+/*  - Agent / Gestionnaire / Capitaine / Propriétaire : code obligatoire */
 /* ------------------------------------------------------------------ */
 export interface VerifyResult {
   ok: boolean;
@@ -123,18 +123,7 @@ export interface VerifyResult {
 }
 
 export const verifyRoleCode = async (role: RegisterRole, code: string, clientKey: string): Promise<VerifyResult> => {
-  await ensureTable();
-  const { rows } = await pool.query(
-    `SELECT code_hash, expires_at
-       FROM role_access_codes
-      WHERE role = $1 AND is_active = TRUE
-      LIMIT 1`,
-    [role],
-  );
-  const row = rows[0];
-
-  // Agent sans code actif : inscription libre
-  if (role === "agent" && !row) return { ok: true };
+  if (role === "client") return { ok: true };
 
   const key = `rolecode:${clientKey}`;
   if (isLimited(key)) {
@@ -144,6 +133,16 @@ export const verifyRoleCode = async (role: RegisterRole, code: string, clientKey
     return { ok: false, error: `Le code d'accès du rôle ${ROLE_LABELS[role]} est obligatoire.` };
   }
 
+  await ensureTable();
+  const { rows } = await pool.query(
+    `SELECT code_hash, expires_at
+       FROM role_access_codes
+      WHERE role = $1 AND is_active = TRUE
+      LIMIT 1`,
+    [role],
+  );
+
+  const row = rows[0];
   const expired = row?.expires_at && new Date(row.expires_at).getTime() < Date.now();
 
   let match = false;
@@ -160,50 +159,11 @@ export const verifyRoleCode = async (role: RegisterRole, code: string, clientKey
   return { ok: true };
 };
 
-// Rôles qui exigent un code à l'inscription (l'Agent seulement si un code Agent est actif)
-export const getRequiredRoles = async (): Promise<CodeRole[]> => {
-  await ensureTable();
-  const { rows } = await pool.query(`SELECT role FROM role_access_codes WHERE is_active = TRUE`);
-  const active = new Set(rows.map((r) => String(r.role)));
-  return CODE_ROLES.filter((r) => r !== "agent" || active.has("agent"));
-};
-
 /* ------------------------------------------------------------------ */
-/* E-mail du code généré                                               */
+/* Routes réservées au Propriétaire (protégées ici même)               */
 /* ------------------------------------------------------------------ */
-const sendCodeEmail = async (to: string, role: CodeRole, code: string, expiresAt: Date) => {
-  const label = ROLE_LABELS[role];
-  const dateFr = expiresAt.toLocaleDateString("fr-FR");
-  await sendMail(
-    to,
-    `Nouveau code d'accès — Rôle ${label}`,
-    `Un nouveau code d'accès pour le rôle ${label} vient d'être généré.\n\nCode : ${code}\nExpire le : ${dateFr}\n\nL'ancien code a été désactivé.\n\nÉquipe SAINT-JUDE`,
-    `<p>Bonjour,</p>
-     <p>Un nouveau code d'accès pour le rôle <b>${label}</b> vient d'être généré.</p>
-     <p style="font-size:22px;font-weight:bold;letter-spacing:2px">${code}</p>
-     <p>Date d'expiration : <b>${dateFr}</b></p>
-     <p>L'ancien code a été désactivé.</p>
-     <p>Cordialement,<br/>Équipe SAINT-JUDE</p>`,
-  );
-};
-
-/* ------------------------------------------------------------------ */
-/* Routes : Propriétaire ET Administrateur (mêmes droits, les 5 codes) */
-/* ------------------------------------------------------------------ */
-const callerRole = (res: Response): RegisterRole | null =>
-  normalizeRole((res.locals.sessionUser as { role?: string } | undefined)?.role);
-
-const canManageCodes: RequestHandler = (_req, res, next) => {
-  const r = callerRole(res);
-  if (r === "proprietaire" || r === "admin") {
-    next();
-    return;
-  }
-  res.status(403).json({ error: "Accès réservé au Propriétaire ou à l'Administrateur." });
-};
-
 const router = Router();
-router.use(requireAuth, canManageCodes);
+router.use(requireAuth, requireOwner);
 
 // État des codes (jamais le code lui-même)
 router.get("/", async (_req, res) => {
@@ -212,7 +172,8 @@ router.get("/", async (_req, res) => {
     const { rows } = await pool.query(
       `SELECT role, is_active, expires_at, created_at
          FROM role_access_codes
-        WHERE is_active = TRUE`,
+        WHERE is_active = TRUE AND role = ANY($1::text[])`,
+      [CODE_ROLES],
     );
     res.json(
       rows.map((r) => ({
@@ -228,21 +189,19 @@ router.get("/", async (_req, res) => {
   }
 });
 
-// Générer / renouveler un code (renvoyé en clair une seule fois + envoyé par e-mail)
+// Générer / renouveler un code (le code en clair n'est renvoyé qu'ici, une seule fois)
 router.post("/", async (req, res) => {
   const role = normalizeRole(req.body?.role);
   const days = Number(req.body?.days);
-  if (!role) return res.status(400).json({ error: "Rôle invalide." });
+  if (!role || role === "client") return res.status(400).json({ error: "Rôle invalide." });
   if (![7, 30, 90].includes(days)) return res.status(400).json({ error: "Durée invalide (7, 30 ou 90 jours)." });
-
-  const sessionUser = res.locals.sessionUser as { id?: string | number } | undefined;
-  const createdBy = sessionUser?.id != null ? String(sessionUser.id) : null;
 
   const client = await pool.connect();
   try {
     await ensureTable();
     const code = generateCode(role);
     const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+    const createdBy = Number((req as any).user?.id) || null;
 
     await client.query("BEGIN");
     await client.query(`UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`, [role]);
@@ -253,22 +212,7 @@ router.post("/", async (req, res) => {
     );
     await client.query("COMMIT");
 
-    // Envoi par e-mail à la personne connectée (n'annule jamais la génération)
-    let emailSent = false;
-    if (createdBy) {
-      try {
-        const { rows } = await pool.query(`SELECT email FROM "user" WHERE id = $1`, [createdBy]);
-        const to = rows[0]?.email;
-        if (to) {
-          await sendCodeEmail(String(to), role, code, expiresAt);
-          emailSent = true;
-        }
-      } catch (mailErr) {
-        console.error("[role-codes] e-mail non envoyé", mailErr);
-      }
-    }
-
-    res.status(201).json({ role, code, expiresAt: expiresAt.toISOString(), emailSent });
+    res.status(201).json({ role, code, expiresAt: expiresAt.toISOString() });
   } catch (err) {
     await client.query("ROLLBACK").catch(() => undefined);
     console.error("[role-codes] POST", err);
@@ -278,10 +222,10 @@ router.post("/", async (req, res) => {
   }
 });
 
-// Désactiver le code actif d'un rôle (pour l'Agent : l'inscription redevient libre)
+// Désactiver le code actif d'un rôle (plus personne ne peut s'inscrire avec ce rôle)
 router.delete("/:role", async (req, res) => {
   const role = normalizeRole(req.params.role);
-  if (!role) return res.status(400).json({ error: "Rôle invalide." });
+  if (!role || role === "client") return res.status(400).json({ error: "Rôle invalide." });
   try {
     await ensureTable();
     await pool.query(`UPDATE role_access_codes SET is_active = FALSE WHERE role = $1 AND is_active = TRUE`, [role]);
