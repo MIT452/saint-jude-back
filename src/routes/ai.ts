@@ -15,7 +15,7 @@ export const aiRouter = Router();
 
 // Marqueur de version : visible dans les logs et dans GET /api/ai/status
 // → permet de vérifier que le serveur exécute bien CE fichier.
-const BUILD = 'ai-2026-11-24-natural-chat';
+const BUILD = 'ai-2026-11-27-prix-saisi';
 console.info(`[IA] ai.ts chargé (build ${BUILD})`);
 
 // Accès base minimal : fonctionne avec `pool` comme avec un client de transaction
@@ -169,6 +169,7 @@ export interface VerifyInput {
   quantite?: number; // places / colis : la capacité d'un bateau (boats.capacity) est en places
   passagers?: number;
   tripId?: string; // restreint la vérification à un voyage précis (après verrouillage)
+  prixKgOverride?: number; // [PRIX] prix au kilo saisi : utilisé SEULEMENT si le voyage n'a pas de tarif
 }
 
 export interface VerifyResult {
@@ -306,7 +307,11 @@ export async function verifyTrip(i: VerifyInput, db: Db = defaultDb): Promise<Ve
     };
   }
 
-  const pricePerKg = Number(trip.price_per_kg);
+  // [PRIX] Le tarif du voyage fait toujours foi. Le prix saisi n'est utilisé que si le voyage n'en a pas.
+  let pricePerKg = Number(trip.price_per_kg);
+  if (!(pricePerKg > 0) && i.prixKgOverride !== undefined && i.prixKgOverride > 0) {
+    pricePerKg = i.prixKgOverride;
+  }
   if (needKg > 0 && !(pricePerKg > 0)) {
     return { available: false, message: 'Le tarif de ce voyage n’est pas encore défini.' };
   }
@@ -1274,6 +1279,7 @@ export interface ReserveInput {
   marchandise?: string;
   unite?: string;
   clientName?: string;
+  prixUnitaireKg?: number; // [PRIX] prix au kilo saisi : utilisé SEULEMENT si le voyage n'a pas de tarif
 }
 
 // Utilisateur connecté (placé par requireAuth dans res.locals.sessionUser)
@@ -1345,7 +1351,14 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
 
     // 1) premier contrôle, puis verrou sur le voyage pour éviter les doubles réservations
     const first = await verifyTrip(
-      { depart: input.depart, arrivee: input.arrivee, date: input.date, poidsTotalKg: total, quantite: qty },
+      {
+        depart: input.depart,
+        arrivee: input.arrivee,
+        date: input.date,
+        poidsTotalKg: total,
+        quantite: qty,
+        prixKgOverride: input.prixUnitaireKg, // [PRIX]
+      },
       tx,
     );
     if (!first.available || !first.tripId) {
@@ -1363,6 +1376,7 @@ export async function reserveTrip(input: ReserveInput, user?: SessionUserLite): 
         poidsTotalKg: total,
         quantite: qty,
         tripId: first.tripId,
+        prixKgOverride: input.prixUnitaireKg, // [PRIX]
       },
       tx,
     );
@@ -1510,6 +1524,16 @@ function readReserveBody(body: any): { value: ReserveInput } | { error: string }
   const text = (v: unknown, max: number) =>
     typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined;
 
+  // [PRIX] prix au kilo saisi (facultatif) : ignoré s'il est absent ou invalide
+  let prixUnitaireKg: number | undefined;
+  if (body?.prixUnitaireKg !== undefined && body?.prixUnitaireKg !== null && body?.prixUnitaireKg !== '') {
+    const p = Number(body.prixUnitaireKg);
+    if (!Number.isFinite(p) || p < 0 || p > 100_000_000) {
+      return { error: 'prixUnitaireKg invalide' };
+    }
+    if (p > 0) prixUnitaireKg = p;
+  }
+
   return {
     value: {
       depart,
@@ -1520,6 +1544,7 @@ function readReserveBody(body: any): { value: ReserveInput } | { error: string }
       marchandise: text(body?.marchandise, 80),
       unite: text(body?.unite, 20),
       clientName: text(body?.clientName, 100),
+      prixUnitaireKg,
     },
   };
 }
